@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GPX Routenplaner</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        #map { height: 70vh; width: 100%; border-radius: 0.5rem; }
+        #loader { display: none; }
+    </style>
+</head>
+<body class="bg-gray-100 font-sans">
+    <div class="container mx-auto p-4">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
+            <!-- Eingabe-Spalte -->
+            <div class="md:col-span-1 bg-white p-6 rounded-lg shadow-lg">
+                <h1 class="text-2xl font-bold mb-4">GPX Routenplaner</h1>
+                <form id="gpx-form">
+                    <!-- Fahrparameter -->
+                    <div class="mb-4">
+                        <label for="averageSpeed" class="block text-sm font-medium text-gray-700">Ø Geschwindigkeit (km/h)</label>
+                        <input type="number" id="averageSpeed" value="20" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm">
+                    </div>
+                    <div class="grid grid-cols-2 gap-4 mb-4">
+                        <div>
+                            <label for="startDate" class="block text-sm font-medium text-gray-700">Startdatum</label>
+                            <input type="date" id="startDate" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm">
+                        </div>
+                        <div>
+                            <label for="startTime" class="block text-sm font-medium text-gray-700">Startzeit</label>
+                            <input type="time" id="startTime" value="09:00" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm">
+                        </div>
+                    </div>
+                    <!-- GPX-Upload -->
+                    <div class="mb-4">
+                        <label for="gpxFile" class="block text-sm font-medium text-gray-700">GPX-Datei</label>
+                        <input type="file" id="gpxFile" accept=".gpx" required class="mt-1 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-600 hover:file:bg-indigo-100">
+                    </div>
+                    <!-- Filter -->
+                    <fieldset class="mb-4">
+                        <legend class="text-sm font-medium text-gray-700">Filter-Optionen</legend>
+                        <div class="mt-2 space-y-2">
+                            <div class="flex items-start">
+                                <div class="flex h-5 items-center"><input id="hideClosed" type="checkbox" checked class="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"></div>
+                                <div class="ml-3 text-sm"><label for="hideClosed" class="font-medium text-gray-700">Geschlossene Shops ausblenden</label></div>
+                            </div>
+                            <div class="flex items-start">
+                                <div class="flex h-5 items-center"><input id="onlySlower" type="checkbox" class="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"></div>
+                                <div class="ml-3 text-sm"><label for="onlySlower" class="font-medium text-gray-700">Zeitfenster nur "langsamer" (-10%)</label></div>
+                            </div>
+                        </div>
+                    </fieldset>
+                    <!-- POIs -->
+                    <fieldset>
+                        <legend class="text-sm font-medium text-gray-700">POIs suchen</legend>
+                         <div class="mt-2 space-y-2">
+                            <div class="flex items-start">
+                                <div class="flex h-5 items-center"><input id="searchMc" type="checkbox" checked class="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"></div>
+                                <div class="ml-3 text-sm"><label for="searchMc" class="font-medium text-gray-700">McDonald's</label></div>
+                            </div>
+                         </div>
+                    </fieldset>
+                    <!-- Button -->
+                    <div class="mt-6">
+                        <button type="submit" class="w-full inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+                            Karte generieren
+                        </button>
+                    </div>
+                </form>
+            </div>
+
+            <!-- Karten-Spalte -->
+            <div class="md:col-span-2 relative bg-white p-6 rounded-lg shadow-lg">
+                <div id="map"></div>
+                <div id="loader" class="absolute inset-0 bg-white/70 flex flex-col items-center justify-center rounded-lg">
+                    <svg class="animate-spin h-8 w-8 text-indigo-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                    <p class="mt-2 text-gray-600">Karte wird generiert, bitte warten...</p>
+                </div>
+                 <div id="message" class="hidden mt-4 p-4 rounded-md"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        // Setzt das heutige Datum im Datumsfeld
+        document.getElementById('startDate').valueAsDate = new Date();
+        
+        const map = L.map('map').setView([51.505, -0.09], 13);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+
+        const form = document.getElementById('gpx-form');
+        const loader = document.getElementById('loader');
+        const messageDiv = document.getElementById('message');
+        let gpxLayer = L.layerGroup().addTo(map);
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault(); // Verhindert das Neuladen der Seite
+            
+            // Zeigt die Ladeanzeige und löscht alte Ergebnisse
+            loader.style.display = 'flex';
+            messageDiv.style.display = 'none';
+            gpxLayer.clearLayers();
+
+            // Sammelt alle Daten aus dem Formular
+            const formData = new FormData();
+            formData.append('gpxFile', document.getElementById('gpxFile').files[0]);
+            formData.append('averageSpeed', document.getElementById('averageSpeed').value);
+            formData.append('startDate', document.getElementById('startDate').value);
+            formData.append('startTime', document.getElementById('startTime').value);
+            formData.append('hideClosed', document.getElementById('hideClosed').checked);
+            formData.append('onlySlower', document.getElementById('onlySlower').checked);
+            formData.append('searchMc', document.getElementById('searchMc').checked);
+            
+            try {
+                // Sendet die Daten an das Python-Backend
+                const response = await fetch('/generate-map', {
+                    method: 'POST',
+                    body: formData,
+                });
+
+                const result = await response.json();
+
+                if (!response.ok || !result.success) {
+                    throw new Error(result.error || 'Unbekannter Serverfehler');
+                }
+                
+                // Zeichnet die Ergebnisse auf der Karte
+                L.polyline(result.route, { color: '#3388ff' }).addTo(gpxLayer);
+                // Hier würde der Code stehen, um die POIs und Zeitmarker zu zeichnen
+                // basierend auf `result.pois` und `result.time_markers`
+
+                map.fitBounds([
+                    [result.bounds.min_lat, result.bounds.min_lon],
+                    [result.bounds.max_lat, result.bounds.max_lon]
+                ]);
+                
+                showMessage('Karte erfolgreich generiert!', 'success');
+
+            } catch (error) {
+                console.error('Fehler:', error);
+                showMessage(`Fehler: ${error.message}`, 'error');
+            } finally {
+                loader.style.display = 'none'; // Versteckt die Ladeanzeige
+            }
+        });
+
+        function showMessage(text, type) {
+            messageDiv.textContent = text;
+            messageDiv.className = type === 'success' 
+                ? 'mt-4 p-4 rounded-md bg-green-100 text-green-800'
+                : 'mt-4 p-4 rounded-md bg-red-100 text-red-800';
+            messageDiv.style.display = 'block';
+        }
+    </script>
+</body>
+</html>
