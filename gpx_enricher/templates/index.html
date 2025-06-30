@@ -4,7 +4,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GPX Routenplaner</title>
+    <!-- Leaflet und Awesome-Markers (für farbige Symbole) -->
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/Leaflet.awesome-markers/2.0.2/leaflet.awesome-markers.css">
+    <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/font-awesome/4.7.0/css/font-awesome.min.css">
+    
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         #map { height: 70vh; width: 100%; border-radius: 0.5rem; }
@@ -84,6 +88,7 @@
     </div>
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Leaflet.awesome-markers/2.0.2/leaflet.awesome-markers.min.js"></script>
     <script>
         // Setzt das heutige Datum im Datumsfeld
         document.getElementById('startDate').valueAsDate = new Date();
@@ -97,17 +102,15 @@
         const form = document.getElementById('gpx-form');
         const loader = document.getElementById('loader');
         const messageDiv = document.getElementById('message');
-        let gpxLayer = L.layerGroup().addTo(map);
+        let gpxLayerGroup = L.layerGroup().addTo(map);
 
         form.addEventListener('submit', async (e) => {
-            e.preventDefault(); // Verhindert das Neuladen der Seite
+            e.preventDefault(); 
             
-            // Zeigt die Ladeanzeige und löscht alte Ergebnisse
             loader.style.display = 'flex';
             messageDiv.style.display = 'none';
-            gpxLayer.clearLayers();
+            gpxLayerGroup.clearLayers();
 
-            // Sammelt alle Daten aus dem Formular
             const formData = new FormData();
             formData.append('gpxFile', document.getElementById('gpxFile').files[0]);
             formData.append('averageSpeed', document.getElementById('averageSpeed').value);
@@ -118,7 +121,6 @@
             formData.append('searchMc', document.getElementById('searchMc').checked);
             
             try {
-                // Sendet die Daten an das Python-Backend
                 const response = await fetch('/generate-map', {
                     method: 'POST',
                     body: formData,
@@ -130,15 +132,47 @@
                     throw new Error(result.error || 'Unbekannter Serverfehler');
                 }
                 
-                // Zeichnet die Ergebnisse auf der Karte
-                L.polyline(result.route, { color: '#3388ff' }).addTo(gpxLayer);
-                // Hier würde der Code stehen, um die POIs und Zeitmarker zu zeichnen
-                // basierend auf `result.pois` und `result.time_markers`
+                // --- FIX: Logik zum Zeichnen der Ergebnisse hinzugefügt ---
 
-                map.fitBounds([
-                    [result.bounds.min_lat, result.bounds.min_lon],
-                    [result.bounds.max_lat, result.bounds.max_lon]
-                ]);
+                // 1. Route zeichnen
+                if (result.route && result.route.length > 0) {
+                    L.polyline(result.route, { color: '#3388ff' }).addTo(gpxLayerGroup);
+                }
+
+                // 2. POI-Marker zeichnen
+                if (result.pois && result.pois.length > 0) {
+                    result.pois.forEach(poi => {
+                        const icon = L.AwesomeMarkers.icon({
+                            icon: poi.icon.symbol,
+                            prefix: 'fa',
+                            markerColor: poi.icon.color
+                        });
+                        L.marker([poi.lat, poi.lon], { icon: icon })
+                          .bindPopup(poi.popup)
+                          .addTo(gpxLayerGroup);
+                    });
+                }
+                
+                // 3. Zeitmarker zeichnen
+                if (result.time_markers && result.time_markers.length > 0) {
+                    result.time_markers.forEach(marker => {
+                        L.polyline(marker.line_coords, { color: 'purple', weight: 2, opacity: 0.7 }).addTo(gpxLayerGroup);
+                        
+                        const timeIcon = L.divIcon({
+                            className: 'time-marker-label',
+                            html: `<div style='font-size: 10pt; color: purple; font-weight: bold;'>${marker.label_text}</div>`
+                        });
+                        L.marker(marker.label_pos, { icon: timeIcon }).addTo(gpxLayerGroup);
+                    });
+                }
+
+                // Karte auf die Route zoomen
+                if(result.bounds) {
+                    map.fitBounds([
+                        [result.bounds.min_lat, result.bounds.min_lon],
+                        [result.bounds.max_lat, result.bounds.max_lon]
+                    ]);
+                }
                 
                 showMessage('Karte erfolgreich generiert!', 'success');
 
