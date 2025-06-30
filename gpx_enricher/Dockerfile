@@ -1,6 +1,6 @@
 # Phase 1: Build-Umgebung
 # Verwendet ein schlankes Python-Image
-FROM python:3.12-slim as builder
+FROM python:3.12-slim AS builder
 
 # Setzt das Arbeitsverzeichnis
 WORKDIR /app
