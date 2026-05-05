@@ -1,5 +1,6 @@
 from flask import Flask, render_template, request, jsonify
 import gpxpy
+import numpy as np
 import requests
 import json
 import datetime
@@ -12,6 +13,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # Initialisiert die Flask-Anwendung
 app = Flask(__name__)
+
+OVERPASS_HEADERS = {'User-Agent': 'GPXtoPOI/1.0 (personal bike touring tool)'}
+TRACK_THINNING_M = 200
 
 # --- Die Kernlogik aus dem Notebook, verpackt in Funktionen ---
 
@@ -41,16 +45,17 @@ def find_point_at_distance(target_dist, track_points_with_dist):
             return (lat, lon), bearing
     return None
 
-def find_closest_point_on_track(poi_coords, track_points_with_dist):
-    """Findet den nächstgelegenen Punkt auf der Route zu einem gegebenen POI."""
-    min_dist = float('inf')
-    closest_point_info = None
-    for point, distance_from_start in track_points_with_dist:
-        dist = geodesic(poi_coords, (point.latitude, point.longitude)).meters
-        if dist < min_dist:
-            min_dist = dist
-            closest_point_info = (point, distance_from_start)
-    return closest_point_info
+def thin_track(track_points_with_dist, min_spacing_m):
+    """Reduziert die Trackpunkte auf maximal einen Punkt pro min_spacing_m Meter."""
+    if not track_points_with_dist:
+        return track_points_with_dist
+    thinned = [track_points_with_dist[0]]
+    for pt, dist in track_points_with_dist[1:]:
+        if dist - thinned[-1][1] >= min_spacing_m:
+            thinned.append((pt, dist))
+    if thinned[-1] is not track_points_with_dist[-1]:
+        thinned.append(track_points_with_dist[-1])
+    return thinned
 
 def process_gpx_data(gpx, average_speed_kmh, start_datetime_utc, hide_closed, only_slower, search_mc):
     """Die Hauptfunktion, die alle Berechnungen durchführt und Daten für das Frontend vorbereitet."""
@@ -64,12 +69,15 @@ def process_gpx_data(gpx, average_speed_kmh, start_datetime_utc, hide_closed, on
                 if i > 0: dist_so_far += point.distance_2d(segment.points[i-1])
                 track_points_with_dist.append((point, dist_so_far))
     
-    all_track_points = [p[0] for p in track_points_with_dist]
-    if not all_track_points: return [], [], []
+    if not track_points_with_dist: return [], [], []
+
+    # Ausdünnung für API-Abfragen und Zeitmarker
+    thinned = thin_track(track_points_with_dist, TRACK_THINNING_M)
+    all_track_points = [p[0] for p in thinned]
 
     # 2. Zeitmarker (Stunden) berechnen
     time_markers = []
-    total_distance_m = track_points_with_dist[-1][1]
+    total_distance_m = thinned[-1][1]
     speed_ms = (average_speed_kmh * 1000) / 3600
     if speed_ms > 0:
         total_duration_s = total_distance_m / speed_ms
@@ -83,7 +91,7 @@ def process_gpx_data(gpx, average_speed_kmh, start_datetime_utc, hide_closed, on
         while (current_marker_time_utc - start_datetime_utc).total_seconds() <= total_duration_s:
             elapsed_seconds = (current_marker_time_utc - start_datetime_utc).total_seconds()
             distance_marker = speed_ms * elapsed_seconds
-            result = find_point_at_distance(distance_marker, track_points_with_dist)
+            result = find_point_at_distance(distance_marker, thinned)
             if result:
                 point_coords, bearing = result
                 perp_bearing1 = (bearing + 90) % 360
@@ -105,25 +113,29 @@ def process_gpx_data(gpx, average_speed_kmh, start_datetime_utc, hide_closed, on
     tf = TimezoneFinder()
     num_chunks = (len(all_track_points) + CHUNK_SIZE - 1) // CHUNK_SIZE
 
+    # Koordinaten-Arrays für vektorisierte Nächster-Punkt-Suche (numpy, kein Loop)
+    track_lats = np.array([p.latitude for p in all_track_points])
+    track_lons = np.array([p.longitude for p in all_track_points])
+    cos_lat_factor = np.cos(np.radians(np.mean(track_lats)))
+
     for i in range(0, len(all_track_points), CHUNK_SIZE):
         chunk = all_track_points[i:i + CHUNK_SIZE + 1]
-        flat_coords = [str(coord) for point in chunk for coord in (point.latitude, point.longitude)]
-        points_str = ",".join(flat_coords)
-        
-        mcdonalds_query_part = ""
-        if search_mc:
-            mcdonalds_query_part = f'nwr(around:1000,{points_str})["amenity"="fast_food"]["brand"~"McDonald\'s",i];'
+        points_str = ",".join(str(c) for pt in chunk for c in (pt.latitude, pt.longitude))
+
+        mcdonalds_query_part = 'nwr.r["amenity"="fast_food"]["brand"~"McDonald\'s",i];' if search_mc else ""
 
         overpass_query = f"""
-        [out:json][timeout:90];(
-          nwr(around:1000,{points_str})["amenity"="fuel"];
-          nwr(around:1000,{points_str})["shop"="supermarket"];
-          nwr(around:1000,{points_str})["shop"="convenience"];
+        [out:json][timeout:90];
+        nwr(around:1000,{points_str}) -> .r;
+        (
+          nwr.r["amenity"="fuel"];
+          nwr.r["shop"="supermarket"];
+          nwr.r["shop"="convenience"];
           {mcdonalds_query_part}
         );out center;
         """
         try:
-            response = requests.post("https://overpass-api.de/api/interpreter", data={'data': overpass_query})
+            response = requests.post("https://overpass-api.de/api/interpreter", data={'data': overpass_query}, headers=OVERPASS_HEADERS)
             response.raise_for_status()
             data = response.json()
             print(f"Abschnitt {i // CHUNK_SIZE + 1}: {len(data['elements'])} POIs von Overpass erhalten.")
@@ -136,10 +148,11 @@ def process_gpx_data(gpx, average_speed_kmh, start_datetime_utc, hide_closed, on
                 lon = element.get('lon') or element.get('center', {}).get('lon')
                 if not lat or not lon: continue
 
-                closest_point_tuple = find_closest_point_on_track((lat, lon), track_points_with_dist)
-                if not closest_point_tuple: continue
-                
-                distance_to_poi_m = closest_point_tuple[1]
+                # Vektorisierte Nächster-Punkt-Suche mit numpy (flat-earth-Näherung)
+                dlat = track_lats - lat
+                dlon = (track_lons - lon) * cos_lat_factor
+                idx = int(np.argmin(dlat**2 + dlon**2))
+                distance_to_poi_m = thinned[idx][1]
                 
                 travel_time_avg_s = distance_to_poi_m / speed_ms if speed_ms > 0 else 0
                 eta_avg_utc = start_datetime_utc + datetime.timedelta(seconds=travel_time_avg_s)
