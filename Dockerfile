@@ -36,4 +36,4 @@ ENV FLASK_RUN_HOST=0.0.0.0
 
 # Der Befehl, der beim Starten des Containers ausgeführt wird
 # Gunicorn ist ein robusterer Produktionsserver als der Flask-Entwicklungsserver
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--timeout", "600", "app:app"]
