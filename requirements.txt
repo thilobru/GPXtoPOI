@@ -1,9 +1,7 @@
 flask
 gpxpy
 requests
-folium
 geopy
 opening-hours-py
 timezonefinder
 gunicorn
-weasyprint
