@@ -1,0 +1,681 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GPX-Routen-Anzeige</title>
+    <!-- Leaflet CSS für Kartendarstellung -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+    <!-- Tailwind CSS für Styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Benutzerdefinierte Stile -->
+    <style>
+        /* Stellt sicher, dass der Kartencontainer eine definierte Höhe hat */
+        #map { 
+            height: 600px; 
+            width: 100%;
+            cursor: grab;
+        }
+        #map:active {
+             cursor: grabbing;
+        }
+        /* Stil für den Übergang des Fortschrittsbalkens */
+        #progress-bar {
+            transition: width 0.3s ease-in-out;
+        }
+        /* Macht den Lade-Overlay nicht interaktiv, wenn er ausgeblendet ist. */
+        #loader.hidden {
+            display: none;
+        }
+        #loader {
+            display: flex;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 font-sans leading-normal tracking-normal">
+
+    <div class="container mx-auto p-4 md:p-8">
+        <div class="bg-white rounded-lg shadow-xl p-6">
+            <h1 class="text-2xl md:text-3xl font-bold text-gray-800 mb-4">GPX-Routen-Anzeige</h1>
+            <p class="text-gray-600 mb-6">Laden Sie eine GPX-Datei hoch, um Ihre Route auf der Karte anzuzeigen.</p>
+
+            <!-- Dateieingabe -->
+            <div class="mb-6">
+                <label for="gpx-file" class="block text-gray-700 text-sm font-bold mb-2">GPX-Datei hochladen:</label>
+                <input type="file" id="gpx-file" accept=".gpx" class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline">
+            </div>
+
+            <!-- Kartencontainer -->
+            <div id="map-container" class="relative">
+                <div id="map" class="rounded-lg"></div>
+                <!-- Fortschritts-/Lade-Overlay -->
+                <div id="loader" class="absolute inset-0 bg-white bg-opacity-85 flex-col items-center justify-center hidden rounded-lg">
+                    <div class="w-11/12 max-w-md bg-gray-200 rounded-full h-4 mb-4 shadow-inner">
+                        <div id="progress-bar" class="bg-blue-600 h-4 rounded-full" style="width: 0%"></div>
+                    </div>
+                    <p id="status-text" class="text-gray-700 font-semibold text-lg">Verarbeite...</p>
+                </div>
+            </div>
+
+             <!-- Nachrichtenbox -->
+            <div id="message-box" class="hidden mt-4 p-4 rounded relative" role="alert">
+                <strong class="font-bold" id="message-title"></strong>
+                <span class="block sm:inline" id="message-text"></span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    
+    <!-- Robuste, stabile und korrekte Version der leaflet-gpx-Bibliothek direkt eingebettet -->
+    <script>
+    L.GPX = L.FeatureGroup.extend({
+        initialize: function(gpx, options) {
+            L.Util.setOptions(this, options);
+            this._gpx = gpx;
+            this._layers = {};
+
+            if (gpx) {
+                this.addGPX(gpx, options, this.options.async);
+            }
+        },
+
+        addGPX: function(url, options, async) {
+            var self = this;
+            if (options === undefined) {
+                options = {};
+            }
+            if (async === undefined) {
+                async = self.options.async;
+            }
+
+            L.Util.setOptions(self, options);
+            this._gpx = url;
+            this._layers = {};
+
+            if (async) {
+                setTimeout(function() {
+                    self._parse(url, false, self.options.gpx_options);
+                }, 0);
+                return;
+            }
+            this._parse(url, false, this.options.gpx_options);
+        },
+
+        get_duration_string: function(duration, hidems) {
+            var s = '';
+            if (duration) {
+                var h = Math.floor(duration / 3600000);
+                var m = Math.floor((duration - (h * 3600000)) / 60000);
+                var sec = Math.floor((duration - (h * 3600000) - (m * 60000)) / 1000);
+
+                if (isNaN(h) || isNaN(m) || isNaN(sec)) {
+                    return '';
+                }
+
+                if (hidems) {
+                    if (h > 0) {
+                        s = h + 'h ' + m + 'min';
+                    } else {
+                        s = m + 'min ' + sec + 's';
+                    }
+                } else {
+                    if (h < 10) {
+                        s = s + '0';
+                    }
+                    s = s + h + ':';
+                    if (m < 10) {
+                        s = s + '0';
+                    }
+                    s = s + m + ':';
+                    if (sec < 10) {
+                        s = s + '0';
+                    }
+                    s = s + sec;
+                }
+            }
+            return s;
+        },
+
+        get_duration_string_iso: function(duration, hidems) {
+            var s = this.get_duration_string(duration, hidems);
+            if (!s) {
+                return '';
+            }
+            return (new Date(s * 1000)).toISOString().substr(11, 8)
+        },
+
+        // Public methods
+        get_name: function() {
+            return this._info.name;
+        },
+        get_desc: function() {
+            return this._info.desc;
+        },
+        get_author: function() {
+            return this._info.author;
+        },
+        get_copyright: function() {
+            return this._info.copyright;
+        },
+        get_distance: function() {
+            return this._info.length;
+        },
+        get_distance_imp: function() {
+            return this.get_distance() / 1.60934;
+        },
+
+        get_start_time: function() {
+            return this._info.start;
+        },
+        get_end_time: function() {
+            return this._info.end;
+        },
+        get_moving_time: function() {
+            return this._info.movingTime;
+        },
+        get_total_time: function() {
+            return this._info.totalTime;
+        },
+
+        get_moving_speed: function() {
+            return this._info.movingSpeed;
+        },
+        get_moving_speed_imp: function() {
+            return this._info.movingSpeed / 1.60934;
+        },
+
+        get_total_speed: function() {
+            return this._info.totalSpeed;
+        },
+        get_total_speed_imp: function() {
+            return this._info.totalSpeed / 1.60934;
+        },
+
+        get_elevation_gain: function() {
+            return this._info.elevation.gain;
+        },
+        get_elevation_loss: function() {
+            return this._info.elevation.loss;
+        },
+        get_elevation_gain_imp: function() {
+            return this.get_elevation_gain() * 3.2808399;
+        },
+        get_elevation_loss_imp: function() {
+            return this.get_elevation_loss() * 3.2808399;
+        },
+        get_elevation_max: function() {
+            return this._info.elevation.max;
+        },
+        get_elevation_min: function() {
+            return this._info.elevation.min;
+        },
+        get_elevation_max_imp: function() {
+            return this.get_elevation_max() * 3.2808399;
+        },
+        get_elevation_min_imp: function() {
+            return this.get_elevation_min() * 3.2808399;
+        },
+
+        get_average_hr: function() {
+            return this._info.hr.avg;
+        },
+        get_average_temp: function() {
+            return this._info.atemp.avg;
+        },
+        get_average_cadence: function() {
+            return this._info.cad.avg;
+        },
+
+        get_heartrate_data: function() {
+            return this._info.hr.data;
+        },
+        get_cadence_data: function() {
+            return this._info.cad.data;
+        },
+        get_temp_data: function() {
+            return this._info.atemp.data;
+        },
+        get_elevation_data: function() {
+            return this._info.elevation.data;
+        },
+        get_points_data: function() {
+            return this._info.points;
+        },
+        get_gpx_data: function() {
+            return this._info;
+        },
+        reload: function() {
+            this.clearLayers();
+            this.addGPX(this._gpx, this.options, this.options.async);
+        },
+
+        _parse: function(input, isURL, options) {
+            var self = this;
+            var cb = function(gpx, options) {
+                self._gpx_data = self._prepare_data(gpx, options, self);
+                self.fire('loaded', {
+                    target: self,
+                    gpx: gpx
+                });
+            };
+            if (isURL) {
+                var xhr = new XMLHttpRequest();
+                xhr.open('GET', input);
+                xhr.onload = function() {
+                    if (this.status === 200) {
+                        cb(this.responseXML, options);
+                    }
+                };
+                xhr.send();
+            } else {
+                if (typeof input === 'string') {
+                    try {
+                        var domParser = new DOMParser();
+                        var gpxDom = domParser.parseFromString(input, 'text/xml');
+                        if (gpxDom.getElementsByTagName('parsererror').length) {
+                             self.fire('error', { err: "Error parsing GPX data." });
+                             return;
+                        }
+                        cb(gpxDom, options);
+                    } catch(e) {
+                        self.fire('error', { err: "Error parsing GPX data: " + e });
+                    }
+                } else {
+                    cb(input, options);
+                }
+            }
+        },
+
+        _prepare_data: function(gpx, options, self) {
+            var info = {
+                name: '',
+                desc: '',
+                author: '',
+                copyright: '',
+                length: 0.0,
+                start: null,
+                end: null,
+                movingTime: 0,
+                totalTime: 0,
+                movingSpeed: 0.0,
+                totalSpeed: 0.0,
+                elevation: {
+                    gain: 0.0,
+                    loss: 0.0,
+                    max: 0.0,
+                    min: Infinity,
+                    data: []
+                },
+                hr: {
+                    avg: 0,
+                    data: []
+                },
+                cad: {
+                    avg: 0,
+                    data: []
+                },
+                atemp: {
+                    avg: 0,
+                    data: []
+                },
+                points: [],
+                tracks: [],
+            };
+
+            var parse_trk_name = function(val) {
+                var name = val.getElementsByTagName('name');
+                if (name.length > 0) {
+                    info.name = name[0].textContent;
+                }
+            };
+            var parse_trk_desc = function(val) {
+                var desc = val.getElementsByTagName('desc');
+                if (desc.length > 0) {
+                    info.desc = desc[0].textContent;
+                }
+            };
+            var parse_author = function(val) {
+                var author = val.getElementsByTagName('author');
+                if (author.length > 0) {
+                    info.author = author[0].textContent;
+                }
+            };
+            var parse_copyright = function(val) {
+                var copyright = val.getElementsByTagName('copyright');
+                if (copyright.length > 0) {
+                    info.copyright = copyright[0].textContent;
+                }
+            };
+
+            var get_pts = function(val) {
+                var trkpts = val.getElementsByTagName('trkpt');
+                if (trkpts.length === 0) {
+                    trkpts = val.getElementsByTagName('rtept');
+                }
+                return trkpts;
+            };
+
+            var parse_trkseg = function(line, options) {
+                var el, sub_el, pt, pts = [],
+                    n = 0;
+                var trkpts = get_pts(line);
+
+                if (!trkpts.length) {
+                    return [];
+                }
+
+                for (var i = 0; i < trkpts.length; i++) {
+                    pt = trkpts[i];
+                    el = pt.getElementsByTagName('ele');
+                    var ele = null;
+                    if (el.length > 0) {
+                        ele = parseFloat(el[0].textContent);
+                    }
+
+                    var time = pt.getElementsByTagName('time');
+                    var t = null;
+                    if (time.length > 0) {
+                        t = new Date(Date.parse(time[0].textContent));
+                    }
+
+                    var hr = null,
+                        cad = null,
+                        atemp = null;
+                    var extensions = pt.getElementsByTagName('extensions');
+                    if (extensions.length > 0) {
+                        sub_el = extensions[0].getElementsByTagName('hr');
+                        if (sub_el.length > 0) {
+                            hr = parseInt(sub_el[0].textContent);
+                        }
+                        sub_el = extensions[0].getElementsByTagName('cad');
+                        if (sub_el.length > 0) {
+                            cad = parseInt(sub_el[0].textContent);
+                        }
+                        sub_el = extensions[0].getElementsByTagName('atemp');
+                        if (sub_el.length > 0) {
+                            atemp = parseInt(sub_el[0].textContent);
+                        }
+                    }
+
+                    pts.push({
+                        lat: parseFloat(pt.getAttribute('lat')),
+                        lon: parseFloat(pt.getAttribute('lon')),
+                        ele: ele,
+                        time: t,
+                        hr: hr,
+                        cad: cad,
+                        atemp: atemp
+                    });
+                }
+                return pts;
+            };
+
+            var trks = gpx.getElementsByTagName('trk');
+            if (trks.length === 0) {
+                trks = gpx.getElementsByTagName('rte');
+            }
+
+            for (var i = 0; i < trks.length; i++) {
+                var pts = parse_trkseg(trks[i], options);
+                info.tracks.push(pts);
+                info.points = info.points.concat(pts);
+            }
+
+            var meta = gpx.getElementsByTagName('metadata');
+            if (meta.length > 0) {
+                parse_trk_name(meta[0]);
+                parse_trk_desc(meta[0]);
+                parse_author(meta[0]);
+                parse_copyright(meta[0]);
+            } else if (trks.length > 0) {
+                parse_trk_name(trks[0]);
+                parse_trk_desc(trks[0]);
+            }
+
+            var hr_sum = 0, hr_n = 0;
+            var cad_sum = 0, cad_n = 0;
+            var atemp_sum = 0, atemp_n = 0;
+
+            for (var i = 0; i < info.points.length; i++) {
+                var p = info.points[i];
+                var p_prev = info.points[i - 1];
+
+                if (p.hr !== null) { hr_sum += p.hr; hr_n++; }
+                if (p.cad !== null) { cad_sum += p.cad; cad_n++; }
+                if (p.atemp !== null) { atemp_sum += p.atemp; atemp_n++; }
+
+                if (i > 0) {
+                    info.length += self._dist2d(p_prev, p);
+                    var t_diff = p.time - p_prev.time;
+
+                    if (p.ele !== null && p_prev.ele !== null) {
+                        var ele_diff = p.ele - p_prev.ele;
+                        if (ele_diff > 0) {
+                            info.elevation.gain += ele_diff;
+                        } else {
+                            info.elevation.loss += Math.abs(ele_diff);
+                        }
+                    }
+                    if (t_diff < options.max_point_interval) {
+                        info.movingTime += t_diff;
+                    }
+                }
+
+                if (p.ele !== null) {
+                    info.elevation.min = Math.min(info.elevation.min, p.ele);
+                    info.elevation.max = Math.max(info.elevation.max, p.ele);
+                }
+                info.elevation.data.push([info.length, p.ele]);
+                if (p.hr !== null) info.hr.data.push([info.length, p.hr]);
+                if (p.cad !== null) info.cad.data.push([info.length, p.cad]);
+                if (p.atemp !== null) info.atemp.data.push([info.length, p.atemp]);
+            }
+
+            if(info.points.length > 0){
+                info.start = info.points[0].time;
+                info.end = info.points[info.points.length - 1].time;
+                if (info.end && info.start) {
+                    info.totalTime = info.end - info.start;
+                }
+            } else {
+                return info;
+            }
+
+
+            if (info.movingTime > 0) {
+                info.movingSpeed = info.length / (info.movingTime / 1000) * 3.6;
+            }
+            if (info.totalTime > 0) {
+                info.totalSpeed = info.length / (info.totalTime / 1000) * 3.6;
+            }
+            if (hr_n > 0) info.hr.avg = hr_sum / hr_n;
+            if (cad_n > 0) info.cad.avg = cad_sum / cad_n;
+            if (atemp_n > 0) info.atemp.avg = atemp_sum / atemp_n;
+
+            var polyline = this._polyline(info.tracks, options);
+            this.addLayer(polyline);
+
+            if (options.marker_options.startIconUrl) {
+                var s = new L.Marker(info.points[0], {
+                    clickable: options.marker_options.clickable,
+                    icon: L.icon({
+                        iconUrl: options.marker_options.startIconUrl,
+                        shadowUrl: options.marker_options.shadowUrl,
+                        iconSize: options.marker_options.iconSize,
+                        iconAnchor: options.marker_options.iconAnchor,
+                        shadowSize: options.marker_options.shadowSize,
+                        shadowAnchor: options.marker_options.shadowAnchor
+                    })
+                });
+                this.addLayer(s);
+            }
+
+            if (options.marker_options.endIconUrl) {
+                var e = new L.Marker(info.points[info.points.length - 1], {
+                    clickable: options.marker_options.clickable,
+                    icon: L.icon({
+                        iconUrl: options.marker_options.endIconUrl,
+                        shadowUrl: options.marker_options.shadowUrl,
+                        iconSize: options.marker_options.iconSize,
+                        iconAnchor: options.marker_options.iconAnchor,
+                        shadowSize: options.marker_options.shadowSize,
+                        shadowAnchor: options.marker_options.shadowAnchor
+                    })
+                });
+                this.addLayer(e);
+            }
+            return info;
+        },
+
+        _polyline: function(tracks, options) {
+            var polylines = [];
+            for (var i = 0; i < tracks.length; i++) {
+                polylines.push(tracks[i].map(function(p) {
+                    return new L.LatLng(p.lat, p.lon);
+                }));
+            }
+            return new L.Polyline(polylines, options.polyline_options);
+        },
+
+        _dist2d: function(a, b) {
+            var R = 6371000;
+            var dLat = this._deg2rad(b.lat - a.lat);
+            var dLon = this._deg2rad(b.lon - a.lon);
+            var r = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.cos(this._deg2rad(a.lat)) * Math.cos(this._deg2rad(b.lat)) *
+                Math.sin(dLon / 2) * Math.sin(dLon / 2);
+            var c = 2 * Math.atan2(Math.sqrt(r), Math.sqrt(1 - r));
+            var d = R * c;
+            return d;
+        },
+
+        _deg2rad: function(deg) {
+            return deg * Math.PI / 180;
+        }
+    });
+    </script>
+    
+    <!-- Hauptanwendungslogik -->
+    <script>
+        // DOM-Element-Referenzen
+        const gpxFileInput = document.getElementById('gpx-file');
+        const mapContainer = document.getElementById('map');
+        const loader = document.getElementById('loader');
+        const messageBox = document.getElementById('message-box');
+        const messageTitle = document.getElementById('message-title');
+        const messageText = document.getElementById('message-text');
+        const progressBar = document.getElementById('progress-bar');
+        const statusText = document.getElementById('status-text');
+
+        // Leaflet-Karte initialisieren
+        const map = L.map('map').setView([51.505, -0.09], 13);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+
+        let gpxLayer = null;
+
+        // --- Event-Listener ---
+        gpxFileInput.addEventListener('change', handleFileSelect);
+
+        /**
+         * Behandelt die Auswahl einer GPX-Datei.
+         */
+        function handleFileSelect(event) {
+            const file = event.target.files[0];
+            if (!file) {
+                return;
+            }
+            
+            hideMessage();
+            if (gpxLayer) map.removeLayer(gpxLayer);
+            gpxLayer = null;
+
+            const reader = new FileReader();
+            reader.onload = (e) => processGPX(e.target.result);
+            reader.onerror = () => {
+                hideProgress();
+                displayMessage('Fehler!', 'Fehler beim Lesen der Datei.');
+            };
+            
+            updateProgress('Lese Datei...', 10);
+            reader.readAsText(file);
+        }
+
+        /**
+         * Parst GPX-Daten und zeigt die Route an.
+         */
+        function processGPX(gpxContent) {
+            updateProgress('Parse GPX-Daten...', 25);
+
+            // Die eingebettete L.GPX Bibliothek verwenden
+            gpxLayer = new L.GPX(gpxContent, {
+                async: true,
+                max_point_interval: 20000, 
+                marker_options: {
+                    startIconUrl: `https://cdnjs.cloudflare.com/ajax/libs/leaflet-gpx/1.5.1/pin-icon-start.png`,
+                    endIconUrl: `https://cdnjs.cloudflare.com/ajax/libs/leaflet-gpx/1.5.1/pin-icon-end.png`,
+                    shadowUrl: `https://cdnjs.cloudflare.com/ajax/libs/leaflet-gpx/1.5.1/pin-shadow.png`
+                },
+                polyline_options: {
+                    color: '#3388ff',
+                    weight: 5
+                }
+            });
+
+            gpxLayer.on('loaded', function(e) {
+                updateProgress('Route geladen!', 100);
+                map.fitBounds(e.target.getBounds());
+                const data = e.target.get_gpx_data();
+                displayMessage("Erfolg!", `Route "${data.name}" geladen. Distanz: ${(data.length/1000).toFixed(2)} km.`, "info");
+                setTimeout(hideProgress, 1000);
+            });
+            
+            gpxLayer.on('error', function(e) {
+                 hideProgress();
+                 displayMessage("Fehler!", "Die GPX-Datei konnte nicht geparst werden.", "error");
+                 console.error("GPX Parsing Fehler:", e);
+            });
+
+            gpxLayer.addTo(map);
+        }
+        
+        /**
+         * Zeigt den Fortschrittsbalken und den Statustext an und aktualisiert sie.
+         */
+        function updateProgress(status, percentage) {
+            loader.classList.remove('hidden');
+            statusText.textContent = status;
+            progressBar.style.width = `${percentage}%`;
+        }
+        
+        /** Blendet den Fortschritts-Overlay aus und setzt ihn zurück. */
+        function hideProgress() {
+            loader.classList.add('hidden');
+            setTimeout(() => {
+                progressBar.style.width = '0%';
+                statusText.textContent = 'Verarbeite...';
+            }, 300);
+        }
+
+        /** Zeigt dem Benutzer eine Nachricht an. */
+        function displayMessage(title, message, type = 'error') {
+            messageTitle.textContent = title;
+            messageText.textContent = message;
+            messageBox.classList.remove('hidden');
+            messageBox.className = type === 'error'
+                ? 'mt-4 p-4 bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative'
+                : 'mt-4 p-4 bg-blue-100 border border-blue-400 text-blue-700 px-4 py-3 rounded relative';
+        }
+
+        /** Blendet die Nachrichtenbox aus. */
+        function hideMessage() {
+            messageBox.classList.add('hidden');
+        }
+
+    </script>
+</body>
+</html>

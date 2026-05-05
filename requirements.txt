@@ -1,4 +1,9 @@
+flask
+gpxpy
+requests
 folium
 geopy
-opening_hours
+opening-hours-py
 timezonefinder
+gunicorn
+weasyprint

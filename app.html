@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GPX Routenplaner (Client-Side, Fixed)</title>
+    
+    <!-- 
+      Tailwind CSS Warning: The Play CDN is for development only. 
+      For production, you should install Tailwind as a build step.
+    -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Leaflet and Awesome-Markers Styling -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/Leaflet.awesome-markers/2.0.2/leaflet.awesome-markers.css">
+    <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/font-awesome/4.7.0/css/font-awesome.min.css">
+
+    <!-- 
+      JavaScript Libraries
+      - 'defer' ensures they load without blocking the page and execute in order before the main module script.
+      - These libraries create global variables (e.g., L, gpxParser) on the `window` object.
+    -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Leaflet.awesome-markers/2.0.2/leaflet.awesome-markers.min.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gpx.js/0.4.2/gpx.min.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/opening_hours@3.8.0/dist/opening_hours.min.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/geo-tz@8.0.0/dist/geo-tz.min.js" defer></script>
+    
+    <style>
+        #map { height: 70vh; width: 100%; border-radius: 0.5rem; }
+        #loader { display: none; }
+        .time-marker-label { background-color: transparent; border: none; text-shadow: 1px 1px 2px white, -1px -1px 2px white, 1px -1px 2px white, -1px 1px 2px white; }
+    </style>
+</head>
+<body class="bg-gray-100 font-sans">
+    <div class="container mx-auto p-4">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
+            <!-- Input Column -->
+            <div class="md:col-span-1 bg-white p-6 rounded-lg shadow-lg">
+                <h1 class="text-2xl font-bold mb-4">GPX Routenplaner</h1>
+                <h2 class="text-l font-semibold mb-4 text-indigo-600">Client-Side Version</h2>
+                <form id="gpx-form">
+                    <!-- Driving Parameters -->
+                    <div class="mb-4">
+                        <label for="averageSpeed" class="block text-sm font-medium text-gray-700">Ø Speed (km/h)</label>
+                        <input type="number" id="averageSpeed" value="20" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm">
+                    </div>
+                    <div class="grid grid-cols-2 gap-4 mb-4">
+                        <div>
+                            <label for="startDate" class="block text-sm font-medium text-gray-700">Start Date</label>
+                            <input type="date" id="startDate" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm">
+                        </div>
+                        <div>
+                            <label for="startTime" class="block text-sm font-medium text-gray-700">Start Time</label>
+                            <input type="time" id="startTime" value="09:00" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm">
+                        </div>
+                    </div>
+                    <!-- GPX Upload -->
+                    <div class="mb-4">
+                        <label for="gpxFile" class="block text-sm font-medium text-gray-700">GPX File</label>
+                        <input type="file" id="gpxFile" accept=".gpx" required class="mt-1 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-600 hover:file:bg-indigo-100">
+                    </div>
+                    <!-- Filters -->
+                    <fieldset class="mb-4">
+                        <legend class="text-sm font-medium text-gray-700">Filter Options</legend>
+                        <div class="mt-2 space-y-2">
+                            <div class="flex items-start">
+                                <div class="flex h-5 items-center"><input id="hideClosed" type="checkbox" checked class="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"></div>
+                                <div class="ml-3 text-sm"><label for="hideClosed" class="font-medium text-gray-700">Hide closed POIs</label></div>
+                            </div>
+                            <div class="flex items-start">
+                                <div class="flex h-5 items-center"><input id="onlySlower" type="checkbox" class="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"></div>
+                                <div class="ml-3 text-sm"><label for="onlySlower" class="font-medium text-gray-700">Arrival window "slower" only (-10%)</label></div>
+                            </div>
+                        </div>
+                    </fieldset>
+                    <!-- POIs -->
+                    <fieldset>
+                        <legend class="text-sm font-medium text-gray-700">Search for POIs</legend>
+                         <div class="mt-2 space-y-2">
+                            <div class="flex items-start">
+                                <div class="flex h-5 items-center"><input id="searchMc" type="checkbox" checked class="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"></div>
+                                <div class="ml-3 text-sm"><label for="searchMc" class="font-medium text-gray-700">McDonald's</label></div>
+                            </div>
+                         </div>
+                    </fieldset>
+                    <!-- Button -->
+                    <div class="mt-6">
+                        <button type="submit" class="w-full inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+                            Generate Map
+                        </button>
+                    </div>
+                </form>
+            </div>
+
+            <!-- Map Column -->
+            <div class="md:col-span-2 relative bg-white p-6 rounded-lg shadow-lg">
+                <div id="map"></div>
+                <div id="loader" class="absolute inset-0 bg-white/70 flex flex-col items-center justify-center rounded-lg">
+                    <svg class="animate-spin h-8 w-8 text-indigo-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                    <p id="loader-text" class="mt-2 text-gray-600">Generating map, please wait...</p>
+                </div>
+                 <div id="message" class="hidden mt-4 p-4 rounded-md"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 
+      Main Application Logic
+      - 'type="module"' makes this a modern JS module.
+      - It automatically defers execution until the page is ready.
+      - It allows the use of 'import' for other modules (like Geodesy).
+    -->
+    <script type="module">
+        // Import the Geodesy library, which is an ES Module.
+        import LatLonSpherical from 'https://cdn.jsdelivr.net/npm/geodesy@2.4.0/latlon-spherical.min.js';
+
+        // --- INITIALIZATION ---
+        // Access other libraries (Leaflet, etc.) from the global `window` object.
+        const L = window.L;
+        const opening_hours = window.opening_hours;
+        const geoTz = window.geoTz;
+
+        document.getElementById('startDate').valueAsDate = new Date();
+        const map = L.map('map').setView([51.505, -0.09], 13);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+
+        const form = document.getElementById('gpx-form');
+        const loader = document.getElementById('loader');
+        const loaderText = document.getElementById('loader-text');
+        const messageDiv = document.getElementById('message');
+        let gpxLayerGroup = L.layerGroup().addTo(map);
+        
+        // --- HELPER FUNCTIONS (Ported from Python) ---
+
+        function findPointAtDistance(targetDist, trackPointsWithDist) {
+            if (targetDist < 0 || !trackPointsWithDist.length || targetDist > trackPointsWithDist[trackPointsWithDist.length - 1].dist) {
+                return null;
+            }
+            for (let i = 1; i < trackPointsWithDist.length; i++) {
+                const { point: p1, dist: d1 } = trackPointsWithDist[i - 1];
+                const { point: p2, dist: d2 } = trackPointsWithDist[i];
+                if (d1 <= targetDist && targetDist <= d2) {
+                    if ((d2 - d1) === 0) return { point: p1, bearing: 0 };
+                    
+                    const fraction = (targetDist - d1) / (d2 - d1);
+                    const lat = p1.lat + fraction * (p2.lat - p1.lat);
+                    const lon = p1.lon + fraction * (p2.lon - p1.lon);
+                    
+                    const p1Geo = new LatLonSpherical(p1.lat, p1.lon);
+                    const p2Geo = new LatLonSpherical(p2.lat, p2.lon);
+                    
+                    const bearing = p1Geo.initialBearingTo(p2Geo);
+                    return { point: new LatLonSpherical(lat, lon), bearing: bearing };
+                }
+            }
+            return null;
+        }
+
+        function findClosestPointOnTrack(poiPoint, trackPointsWithDist) {
+            let minDistance = Infinity;
+            let closestPointInfo = null;
+
+            for (const trackPointInfo of trackPointsWithDist) {
+                const trackPointGeo = new LatLonSpherical(trackPointInfo.point.lat, trackPointInfo.point.lon);
+                const distance = poiPoint.distanceTo(trackPointGeo);
+                if (distance < minDistance) {
+                    minDistance = distance;
+                    closestPointInfo = trackPointInfo;
+                }
+            }
+            return closestPointInfo;
+        }
+
+
+        // --- MAIN EVENT LISTENER ---
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault(); 
+            
+            loader.style.display = 'flex';
+            loaderText.textContent = "Generating map, please wait...";
+            messageDiv.style.display = 'none';
+            gpxLayerGroup.clearLayers();
+
+            const gpxFile = document.getElementById('gpxFile').files[0];
+            const averageSpeedKmh = parseFloat(document.getElementById('averageSpeed').value);
+            const startDateStr = document.getElementById('startDate').value;
+            const startTimeStr = document.getElementById('startTime').value;
+            const hideClosed = document.getElementById('hideClosed').checked;
+            const onlySlower = document.getElementById('onlySlower').checked;
+            const searchMc = document.getElementById('searchMc').checked;
+            
+            if (!gpxFile) {
+                showMessage('Please select a GPX file.', 'error');
+                loader.style.display = 'none';
+                return;
+            }
+
+            try {
+                const gpxContent = await gpxFile.text();
+                // FIX: Instantiate gpxParser directly from the window object
+                const gpx = new window.gpxParser();
+                gpx.parse(gpxContent);
+                
+                if (!gpx.tracks.length || !gpx.tracks[0].points.length) {
+                    throw new Error("GPX file contains no track points.");
+                }
+                const allTrackPoints = gpx.tracks[0].points.map(p => ({ lat: p.lat, lon: p.lon }));
+
+                const routeLatLngs = allTrackPoints.map(p => [p.lat, p.lon]);
+                L.polyline(routeLatLngs, { color: '#3388ff' }).addTo(gpxLayerGroup);
+
+                const trackPointsWithDist = [];
+                let distSoFar = 0.0;
+                for (let i = 0; i < allTrackPoints.length; i++) {
+                    const point = allTrackPoints[i];
+                    if (i > 0) {
+                        const prevPoint = allTrackPoints[i-1];
+                        const p1 = new LatLonSpherical(prevPoint.lat, prevPoint.lon);
+                        const p2 = new LatLonSpherical(point.lat, point.lon);
+                        distSoFar += p1.distanceTo(p2);
+                    }
+                    trackPointsWithDist.push({ point: point, dist: distSoFar });
+                }
+
+                const timeMarkers = [];
+                const totalDistanceM = trackPointsWithDist[trackPointsWithDist.length - 1].dist;
+                const speedMs = (averageSpeedKmh * 1000) / 3600;
+                
+                const startDateTimeUtc = new Date(`${startDateStr}T${startTimeStr}:00`);
+
+                if (speedMs > 0) {
+                    const totalDurationS = totalDistanceM / speedMs;
+                    
+                    let currentMarkerTime = new Date(startDateTimeUtc);
+                    currentMarkerTime.setHours(currentMarkerTime.getHours() + 1, 0, 0, 0);
+
+                    while ((currentMarkerTime - startDateTimeUtc) / 1000 <= totalDurationS) {
+                        const elapsedSeconds = (currentMarkerTime - startDateTimeUtc) / 1000;
+                        const distanceMarker = speedMs * elapsedSeconds;
+                        const result = findPointAtDistance(distanceMarker, trackPointsWithDist);
+
+                        if (result) {
+                            const { point, bearing } = result;
+                            const perpBearing1 = (bearing + 90) % 360;
+                            const perpBearing2 = (bearing - 90 + 360) % 360;
+                            
+                            const lineEnd1 = point.destinationPoint(500, perpBearing1);
+                            const lineEnd2 = point.destinationPoint(500, perpBearing2);
+
+                            const displayTime = new Intl.DateTimeFormat('de-DE', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Berlin' }).format(currentMarkerTime);
+
+                            timeMarkers.push({
+                                line_coords: [[lineEnd1.lat, lineEnd1.lon], [lineEnd2.lat, lineEnd2.lon]],
+                                label_pos: [lineEnd1.lat, lineEnd1.lon],
+                                label_text: displayTime
+                            });
+                        }
+                        currentMarkerTime.setHours(currentMarkerTime.getHours() + 1);
+                    }
+                }
+                
+                const poiMarkers = [];
+                const CHUNK_SIZE = 150;
+                const processedPoiIds = new Set();
+                const numChunks = Math.ceil(allTrackPoints.length / CHUNK_SIZE);
+                
+                for (let i = 0; i < allTrackPoints.length; i += CHUNK_SIZE) {
+                    const chunkNum = (i / CHUNK_SIZE) + 1;
+                    loaderText.textContent = `Querying POIs for section ${chunkNum} of ${numChunks}...`;
+
+                    const chunk = allTrackPoints.slice(i, i + CHUNK_SIZE + 1);
+                    const pointsStr = chunk.map(p => `${p.lat},${p.lon}`).join(',');
+
+                    const mcdonaldsQueryPart = searchMc ? `nwr(around:1000,${pointsStr})["amenity"="fast_food"]["brand"~"McDonald's",i];` : '';
+
+                    const overpassQuery = `
+                        [out:json][timeout:90];
+                        (
+                          nwr(around:1000,${pointsStr})["amenity"="fuel"];
+                          nwr(around:1000,${pointsStr})["shop"="supermarket"];
+                          nwr(around:1000,${pointsStr})["shop"="convenience"];
+                          ${mcdonaldsQueryPart}
+                        );
+                        out center;`;
+                    
+                    const response = await fetch("https://overpass-api.de/api/interpreter", {
+                        method: "POST",
+                        body: "data=" + encodeURIComponent(overpassQuery)
+                    });
+                    if (!response.ok) throw new Error(`Overpass API error for chunk ${chunkNum}: ${response.statusText}`);
+                    
+                    const data = await response.json();
+
+                    for (const element of data.elements) {
+                        if (processedPoiIds.has(element.id)) continue;
+                        processedPoiIds.add(element.id);
+
+                        const lat = element.lat || element.center?.lat;
+                        const lon = element.lon || element.center?.lon;
+                        if (!lat || !lon) continue;
+
+                        const poiPoint = new LatLonSpherical(lat, lon);
+                        const closestPointTuple = findClosestPointOnTrack(poiPoint, trackPointsWithDist);
+                        if (!closestPointTuple) continue;
+
+                        const distanceToPoiM = closestPointTuple.dist;
+                        const travelTimeAvgS = (speedMs > 0) ? distanceToPoiM / speedMs : 0;
+                        const etaAvgUtc = new Date(startDateTimeUtc.getTime() + travelTimeAvgS * 1000);
+                        
+                        let etaEarliestUtc, etaLatestUtc;
+                        if (onlySlower) {
+                            etaEarliestUtc = etaAvgUtc;
+                            const speedSlowerMs = speedMs * 0.9;
+                            const travelTimeSlowerS = (speedSlowerMs > 0) ? distanceToPoiM / speedSlowerMs : 0;
+                            etaLatestUtc = new Date(startDateTimeUtc.getTime() + travelTimeSlowerS * 1000);
+                        } else {
+                            const speedFasterMs = speedMs * 1.1;
+                            const speedSlowerMs = speedMs * 0.9;
+                            const travelTimeFasterS = (speedFasterMs > 0) ? distanceToPoiM / speedFasterMs : 0;
+                            const travelTimeSlowerS = (speedSlowerMs > 0) ? distanceToPoiM / speedSlowerMs : 0;
+                            etaEarliestUtc = new Date(startDateTimeUtc.getTime() + travelTimeFasterS * 1000);
+                            etaLatestUtc = new Date(startDateTimeUtc.getTime() + travelTimeSlowerS * 1000);
+                        }
+
+                        const openingHoursStr = element.tags?.opening_hours;
+                        let isDefinitelyClosed = false;
+                        let statusText = "<i>Opening hours unknown</i>";
+                        
+                        const timeZone = geoTz.find(lat, lon)[0];
+                        const timeFormat = { weekday: 'long', hour: '2-digit', minute: '2-digit', timeZone };
+                        const etaAvgLocalStr = new Intl.DateTimeFormat('de-DE', timeFormat).format(etaAvgUtc);
+                        const etaEarliestLocalStr = new Intl.DateTimeFormat('de-DE', {hour: '2-digit', minute: '2-digit', timeZone}).format(etaEarliestUtc);
+                        const etaLatestLocalStr = new Intl.DateTimeFormat('de-DE', {hour: '2-digit', minute: '2-digit', timeZone}).format(etaLatestUtc);
+                        
+                        if (openingHoursStr) {
+                            try {
+                                const oh = new opening_hours(openingHoursStr, { lat, lon });
+                                const isOpen = oh.isOpen(etaAvgUtc);
+                                isDefinitelyClosed = !isOpen;
+                                
+                                const statusColor = isOpen ? 'green' : 'red';
+                                const statusWord = isOpen ? 'Open' : 'Closed';
+                                statusText = `<strong style='color:${statusColor};'>${statusWord}</strong> on arrival`;
+                            } catch (err) {
+                                statusText = "<i>Error parsing opening hours</i>";
+                            }
+                        }
+
+                        if (hideClosed && isDefinitelyClosed) {
+                            continue;
+                        }
+
+                        const tags = element.tags || {};
+                        let poiType = "Unknown", iconColor = "gray", iconSymbol = "question";
+                        if (tags.amenity === 'fuel') { poiType = 'Gas Station'; iconColor = 'red'; iconSymbol = 'tint'; }
+                        else if (tags.shop === 'supermarket') { poiType = 'Supermarket'; iconColor = 'blue'; iconSymbol = 'shopping-cart'; }
+                        else if (tags.shop === 'convenience') { poiType = 'Convenience'; iconColor = 'green'; iconSymbol = 'shopping-basket'; }
+                        else if (tags.amenity === 'fast_food' && tags.brand?.toLowerCase().includes('mcdonald')) { poiType = "McDonald's"; iconColor = 'orange'; iconSymbol = 'cutlery'; }
+                        
+                        const popupHtml = `<b>${poiType}: ${tags.name || 'Unnamed'}</b><br><hr style='margin: 3px 0;'><b>Status:</b> ${statusText}<br><b>Arrival (approx.):</b> ${etaAvgLocalStr} Uhr<br><small><i>Window: ${etaEarliestLocalStr} - ${etaLatestLocalStr}</i></small><br><small>Rule: ${openingHoursStr || 'n/a'}</small>`;
+                        
+                        poiMarkers.push({
+                            lat, lon, popup: popupHtml,
+                            icon: { color: iconColor, symbol: iconSymbol }
+                        });
+                    }
+                }
+
+                loaderText.textContent = "Drawing map...";
+
+                poiMarkers.forEach(poi => {
+                    const icon = L.AwesomeMarkers.icon({
+                        icon: poi.icon.symbol, prefix: 'fa', markerColor: poi.icon.color
+                    });
+                    L.marker([poi.lat, poi.lon], { icon }).bindPopup(poi.popup).addTo(gpxLayerGroup);
+                });
+                
+                timeMarkers.forEach(marker => {
+                    L.polyline(marker.line_coords, { color: 'purple', weight: 2, opacity: 0.7 }).addTo(gpxLayerGroup);
+                    const timeIcon = L.divIcon({
+                        className: 'time-marker-label',
+                        html: `<div style='font-size: 10pt; color: purple; font-weight: bold;'>${marker.label_text}</div>`
+                    });
+                    L.marker(marker.label_pos, { icon: timeIcon }).addTo(gpxLayerGroup);
+                });
+
+                if (gpx.tracks.length > 0) {
+                    const bounds = gpx.tracks[0].bounds;
+                    map.fitBounds([
+                        [bounds.minlat, bounds.minlon],
+                        [bounds.maxlat, bounds.maxlon]
+                    ]);
+                }
+                
+                showMessage(`Map successfully generated with ${poiMarkers.length} POIs.`, 'success');
+
+            } catch (error) {
+                console.error('An error occurred:', error);
+                showMessage(`Error: ${error.message}`, 'error');
+            } finally {
+                loader.style.display = 'none';
+            }
+        });
+
+        function showMessage(text, type) {
+            messageDiv.textContent = text;
+            messageDiv.className = type === 'success' 
+                ? 'mt-4 p-4 rounded-md bg-green-100 text-green-800'
+                : 'mt-4 p-4 rounded-md bg-red-100 text-red-800';
+            messageDiv.style.display = 'block';
+        }
+    </script>
+</body>
+</html>

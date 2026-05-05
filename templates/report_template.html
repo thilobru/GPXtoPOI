@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <title>Routenbericht: {{ route_name }}</title>
+    <style>
+        @page {
+            size: A4;
+            margin: 1.5cm;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            font-size: 10pt;
+            line-height: 1.4;
+            color: #333;
+        }
+        h1 {
+            font-size: 18pt;
+            color: #1a202c;
+            border-bottom: 2px solid #4a5568;
+            padding-bottom: 5px;
+            margin-bottom: 0;
+        }
+        .meta-info {
+            font-size: 9pt;
+            color: #718096;
+            margin-bottom: 20px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        th, td {
+            border: 1px solid #e2e8f0;
+            padding: 8px;
+            text-align: left;
+            vertical-align: top;
+        }
+        th {
+            background-color: #f7fafc;
+            font-weight: bold;
+            color: #4a5568;
+        }
+        .km {
+            font-weight: bold;
+            font-size: 11pt;
+            white-space: nowrap;
+        }
+        .name {
+            font-weight: bold;
+        }
+        .status {
+            font-size: 9pt;
+        }
+        .footer {
+            position: fixed;
+            bottom: -1cm;
+            left: 0;
+            right: 0;
+            text-align: center;
+            font-size: 8pt;
+            color: #a0aec0;
+        }
+    </style>
+</head>
+<body>
+    <div class="footer">
+        Generiert am {{ generation_date }}
+    </div>
+
+    <h1>Routenbericht: {{ route_name }}</h1>
+    <p class="meta-info">Ihre persönliche Auswahl an Stopps entlang der Route.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th style="width:15%;">Distanz</th>
+                <th style="width:45%;">Name / Typ</th>
+                <th style="width:40%;">Status bei Ankunft</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for poi in pois %}
+            <tr>
+                <td class="km">{{ "%.1f"|format(poi.distance_km) }} km</td>
+                <td>
+                    <div class="name">{{ poi.name }}</div>
+                    <div class="type">{{ poi.icon.symbol | replace('-', ' ') | title }}</div>
+                </td>
+                <td class="status">
+                    <div>{{ poi.status_text | safe }}</div>
+                    <div>Ankunft ca. {{ poi.eta_str }} Uhr</div>
+                </td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="3" style="text-align:center;">Keine Stopps für den Bericht ausgewählt.</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+</body>
+</html>
