@@ -11,16 +11,13 @@ from opening_hours.opening_hours import OpeningHours
 from timezonefinder import TimezoneFinder
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-# Initialisiert die Flask-Anwendung
 app = Flask(__name__)
 
 OVERPASS_HEADERS = {'User-Agent': 'GPXtoPOI/1.0 (personal bike touring tool)'}
 TRACK_THINNING_M = 200
 
-# --- Die Kernlogik aus dem Notebook, verpackt in Funktionen ---
-
 def calculate_bearing(p1, p2):
-    """Berechnet die Peilung (Kurs) zwischen zwei GPX-Punkten."""
+    """Compass bearing from p1 to p2, in degrees (0–360)."""
     lat1, lon1 = math.radians(p1.latitude), math.radians(p1.longitude)
     lat2, lon2 = math.radians(p2.latitude), math.radians(p2.longitude)
     dLon = lon2 - lon1
@@ -30,7 +27,7 @@ def calculate_bearing(p1, p2):
     return (initial_bearing + 360) % 360
 
 def find_point_at_distance(target_dist, track_points_with_dist):
-    """Findet durch Interpolation den genauen Lat/Lon-Punkt und die Peilung für eine gegebene Distanz."""
+    """Interpolate the lat/lon position and bearing at a given cumulative distance along the track."""
     if target_dist < 0 or not track_points_with_dist or target_dist > track_points_with_dist[-1][1]:
         return None
     for i in range(1, len(track_points_with_dist)):
@@ -46,7 +43,7 @@ def find_point_at_distance(target_dist, track_points_with_dist):
     return None
 
 def thin_track(track_points_with_dist, min_spacing_m):
-    """Reduziert die Trackpunkte auf maximal einen Punkt pro min_spacing_m Meter."""
+    """Downsample track points to at most one per min_spacing_m metres."""
     if not track_points_with_dist:
         return track_points_with_dist
     thinned = [track_points_with_dist[0]]
@@ -58,9 +55,9 @@ def thin_track(track_points_with_dist, min_spacing_m):
     return thinned
 
 def process_gpx_data(gpx, average_speed_kmh, start_datetime_utc, hide_closed, only_slower, search_mc):
-    """Die Hauptfunktion, die alle Berechnungen durchführt und Daten für das Frontend vorbereitet."""
-    
-    # 1. Distanzen für jeden Punkt der Route berechnen
+    """Run all calculations and return POI markers and time markers for the frontend."""
+
+    # build cumulative distance list
     track_points_with_dist = []
     dist_so_far = 0.0
     for track in gpx.tracks:
@@ -71,11 +68,11 @@ def process_gpx_data(gpx, average_speed_kmh, start_datetime_utc, hide_closed, on
     
     if not track_points_with_dist: return [], [], []
 
-    # Ausdünnung für API-Abfragen und Zeitmarker
+    # thin the track – fewer points means fewer Overpass chunks
     thinned = thin_track(track_points_with_dist, TRACK_THINNING_M)
     all_track_points = [p[0] for p in thinned]
 
-    # 2. Zeitmarker (Stunden) berechnen
+    # hourly time markers
     time_markers = []
     total_distance_m = thinned[-1][1]
     speed_ms = (average_speed_kmh * 1000) / 3600
@@ -106,14 +103,14 @@ def process_gpx_data(gpx, average_speed_kmh, start_datetime_utc, hide_closed, on
                 })
             current_marker_time_utc += datetime.timedelta(hours=1)
 
-    # 3. POIs abrufen und verarbeiten
+    # fetch POIs from Overpass in chunks
     poi_markers = []
     CHUNK_SIZE = 150
     processed_poi_ids = set()
     tf = TimezoneFinder()
     num_chunks = (len(all_track_points) + CHUNK_SIZE - 1) // CHUNK_SIZE
 
-    # Koordinaten-Arrays für vektorisierte Nächster-Punkt-Suche (numpy, kein Loop)
+    # precompute arrays once for fast vectorised closest-point search
     track_lats = np.array([p.latitude for p in all_track_points])
     track_lons = np.array([p.longitude for p in all_track_points])
     cos_lat_factor = np.cos(np.radians(np.mean(track_lats)))
@@ -148,7 +145,7 @@ def process_gpx_data(gpx, average_speed_kmh, start_datetime_utc, hide_closed, on
                 lon = element.get('lon') or element.get('center', {}).get('lon')
                 if not lat or not lon: continue
 
-                # Vektorisierte Nächster-Punkt-Suche mit numpy (flat-earth-Näherung)
+                # flat-earth approx – accurate enough within a 1km search radius
                 dlat = track_lats - lat
                 dlon = (track_lons - lon) * cos_lat_factor
                 idx = int(np.argmin(dlat**2 + dlon**2))
@@ -171,9 +168,7 @@ def process_gpx_data(gpx, average_speed_kmh, start_datetime_utc, hide_closed, on
                     eta_latest_utc = start_datetime_utc + datetime.timedelta(seconds=travel_time_slower_s)
 
                 opening_hours_str = element.get('tags', {}).get('opening_hours')
-                # FIX: Zwei separate Flags für "ist geschlossen" und "Öffnungszeiten bekannt"
                 is_definitely_closed = False
-                opening_hours_known = False
                 status_text = "<i>Öffnungszeiten unbekannt</i>"
                 eta_avg_local, eta_earliest_local, eta_latest_local = eta_avg_utc, eta_earliest_utc, eta_latest_utc
 
@@ -186,7 +181,6 @@ def process_gpx_data(gpx, average_speed_kmh, start_datetime_utc, hide_closed, on
                            eta_earliest_local = eta_earliest_utc.astimezone(local_tz)
                            eta_latest_local = eta_latest_utc.astimezone(local_tz)
                            
-                           opening_hours_known = True # Wir haben eine Regel gefunden
                            is_open = OpeningHours(opening_hours_str).is_open(eta_avg_local)
                            is_definitely_closed = not is_open
 
@@ -196,12 +190,10 @@ def process_gpx_data(gpx, average_speed_kmh, start_datetime_utc, hide_closed, on
                     except Exception:
                         status_text = "<i>Fehler bei Auswertung der Öffnungszeiten</i>"
                 
-                # FIX: Filterlogik korrigiert
-                # Blendet nur aus, wenn die Option aktiv ist UND wir wissen, dass der Shop geschlossen ist.
+                # only skip if we actually know it's closed; no hours = always show
                 if hide_closed and is_definitely_closed:
                     continue
 
-                # --- Marker-Daten für Frontend vorbereiten ---
                 tags = element.get('tags', {})
                 poi_type, icon_color, icon_symbol = "Unbekannt", "gray", "question"
                 if tags.get('amenity') == 'fuel': poi_type, icon_color, icon_symbol = 'Tankstelle', 'red', 'tint'
@@ -222,16 +214,13 @@ def process_gpx_data(gpx, average_speed_kmh, start_datetime_utc, hide_closed, on
     return poi_markers, time_markers
 
 
-# Definiert die Hauptroute für die Webseite
 @app.route('/')
 def index():
     return render_template('index.html')
 
-# Definiert die API-Route, die die GPX-Daten verarbeitet
 @app.route('/generate-map', methods=['POST'])
 def generate_map():
     try:
-        # Empfängt die Daten vom Frontend
         gpx_file = request.files['gpxFile']
         average_speed_kmh = float(request.form['averageSpeed'])
         start_date_str = request.form['startDate']
@@ -240,19 +229,16 @@ def generate_map():
         only_slower = request.form.get('onlySlower') == 'true'
         search_mc = request.form.get('searchMc') == 'true'
 
-        # Liest und parst die GPX-Datei
         gpx_content = gpx_file.read().decode('utf-8')
         gpx = gpxpy.parse(gpx_content)
 
-        # Bereitet die Startzeit vor
         naive_datetime = datetime.datetime.strptime(f"{start_date_str} {start_time_str}", "%Y-%m-%d %H:%M")
         start_datetime_local = naive_datetime.astimezone()
         start_datetime_utc = start_datetime_local.astimezone(datetime.timezone.utc)
-        
-        # Ruft die Kernlogik auf
+
         poi_markers, time_markers = process_gpx_data(gpx, average_speed_kmh, start_datetime_utc, hide_closed, only_slower, search_mc)
-        
-        # Extrahiert die Routenpunkte für die Anzeige im Frontend
+
+        # collect all route coordinates for the map line
         route_points = []
         for track in gpx.tracks:
             for segment in track.segments:
@@ -279,6 +265,5 @@ def generate_map():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 if __name__ == '__main__':
-    # Startet den Flask-Server
     app.run(host='0.0.0.0', port=5000)
 
