@@ -1,46 +1,51 @@
-from flask import Flask, render_template, request, jsonify
+﻿"""Flask backend for GPXtoPOI – processes GPX files and queries Overpass for POIs."""
+# pylint: disable=import-error  # packages are installed in the runtime environment
+
+import datetime
+import math
+from zoneinfo import ZoneInfo
+
 import gpxpy
 import numpy as np
 import requests
-import json
-import datetime
-import math
-import os
+from flask import Flask, render_template, request, jsonify
 from geopy.distance import geodesic
 from opening_hours.opening_hours import OpeningHours
 from timezonefinder import TimezoneFinder
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 app = Flask(__name__)
 
 OVERPASS_HEADERS = {'User-Agent': 'GPXtoPOI/1.0 (personal bike touring tool)'}
 TRACK_THINNING_M = 200
+CHUNK_SIZE = 150
+
 
 def calculate_bearing(p1, p2):
-    """Compass bearing from p1 to p2, in degrees (0–360)."""
+    """Compass bearing from p1 to p2, in degrees (0-360)."""
     lat1, lon1 = math.radians(p1.latitude), math.radians(p1.longitude)
     lat2, lon2 = math.radians(p2.latitude), math.radians(p2.longitude)
-    dLon = lon2 - lon1
-    y = math.sin(dLon) * math.cos(lat2)
-    x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dLon)
-    initial_bearing = math.degrees(math.atan2(y, x))
-    return (initial_bearing + 360) % 360
+    d_lon = lon2 - lon1
+    y = math.sin(d_lon) * math.cos(lat2)
+    x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(d_lon)
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
+
 
 def find_point_at_distance(target_dist, track_points_with_dist):
     """Interpolate the lat/lon position and bearing at a given cumulative distance along the track."""
     if target_dist < 0 or not track_points_with_dist or target_dist > track_points_with_dist[-1][1]:
         return None
     for i in range(1, len(track_points_with_dist)):
-        p1, d1 = track_points_with_dist[i-1]
+        p1, d1 = track_points_with_dist[i - 1]
         p2, d2 = track_points_with_dist[i]
         if d1 <= target_dist <= d2:
-            if (d2 - d1) == 0: return (p1.latitude, p1.longitude), 0
+            if d2 == d1:
+                return (p1.latitude, p1.longitude), 0
             fraction = (target_dist - d1) / (d2 - d1)
             lat = p1.latitude + fraction * (p2.latitude - p1.latitude)
             lon = p1.longitude + fraction * (p2.longitude - p1.longitude)
-            bearing = calculate_bearing(p1, p2)
-            return (lat, lon), bearing
+            return (lat, lon), calculate_bearing(p1, p2)
     return None
+
 
 def thin_track(track_points_with_dist, min_spacing_m):
     """Downsample track points to at most one per min_spacing_m metres."""
@@ -54,172 +59,222 @@ def thin_track(track_points_with_dist, min_spacing_m):
         thinned.append(track_points_with_dist[-1])
     return thinned
 
-def process_gpx_data(gpx, average_speed_kmh, start_datetime_utc, hide_closed, only_slower, search_mc):
-    """Run all calculations and return POI markers and time markers for the frontend."""
 
-    # build cumulative distance list
+def _build_cumulative_track(gpx):
+    """Extract all track points with cumulative distance from a parsed GPX object."""
     track_points_with_dist = []
     dist_so_far = 0.0
     for track in gpx.tracks:
         for segment in track.segments:
             for i, point in enumerate(segment.points):
-                if i > 0: dist_so_far += point.distance_2d(segment.points[i-1])
+                if i > 0:
+                    dist_so_far += point.distance_2d(segment.points[i - 1])
                 track_points_with_dist.append((point, dist_so_far))
-    
-    if not track_points_with_dist: return [], [], []
+    return track_points_with_dist
 
-    # thin the track – fewer points means fewer Overpass chunks
-    thinned = thin_track(track_points_with_dist, TRACK_THINNING_M)
-    all_track_points = [p[0] for p in thinned]
 
-    # hourly time markers
+def _build_time_markers(thinned, speed_ms, start_datetime_utc):
+    """Return a list of hourly time marker dicts (line coords + label) for the frontend."""
     time_markers = []
-    total_distance_m = thinned[-1][1]
-    speed_ms = (average_speed_kmh * 1000) / 3600
-    if speed_ms > 0:
-        total_duration_s = total_distance_m / speed_ms
-        start_hour = start_datetime_utc.hour
-        next_full_hour = (start_hour + 1) % 24
-        current_marker_time_utc = start_datetime_utc.replace(hour=next_full_hour, minute=0, second=0, microsecond=0)
-        if next_full_hour <= start_hour:
-            current_marker_time_utc += datetime.timedelta(days=1)
+    total_duration_s = thinned[-1][1] / speed_ms
+    target_tz = ZoneInfo("Europe/Berlin")
 
-        target_tz = ZoneInfo("Europe/Berlin")
-        while (current_marker_time_utc - start_datetime_utc).total_seconds() <= total_duration_s:
-            elapsed_seconds = (current_marker_time_utc - start_datetime_utc).total_seconds()
-            distance_marker = speed_ms * elapsed_seconds
-            result = find_point_at_distance(distance_marker, thinned)
-            if result:
-                point_coords, bearing = result
-                perp_bearing1 = (bearing + 90) % 360
-                perp_bearing2 = (bearing - 90 + 360) % 360
-                line_end1 = geodesic(kilometers=0.5).destination(point_coords, perp_bearing1)
-                line_end2 = geodesic(kilometers=0.5).destination(point_coords, perp_bearing2)
-                display_time = current_marker_time_utc.astimezone(target_tz)
-                time_markers.append({
-                    "line_coords": [[line_end1.latitude, line_end1.longitude], [line_end2.latitude, line_end2.longitude]],
-                    "label_pos": [line_end1.latitude, line_end1.longitude],
-                    "label_text": display_time.strftime('%H:%M')
-                })
-            current_marker_time_utc += datetime.timedelta(hours=1)
+    start_hour = start_datetime_utc.hour
+    next_full_hour = (start_hour + 1) % 24
+    current_utc = start_datetime_utc.replace(hour=next_full_hour, minute=0, second=0, microsecond=0)
+    if next_full_hour <= start_hour:
+        current_utc += datetime.timedelta(days=1)
 
-    # fetch POIs from Overpass in chunks
+    while (current_utc - start_datetime_utc).total_seconds() <= total_duration_s:
+        elapsed = (current_utc - start_datetime_utc).total_seconds()
+        result = find_point_at_distance(speed_ms * elapsed, thinned)
+        if result:
+            coords, bearing = result
+            end1 = geodesic(kilometers=0.5).destination(coords, (bearing + 90) % 360)
+            end2 = geodesic(kilometers=0.5).destination(coords, (bearing - 90 + 360) % 360)
+            display_time = current_utc.astimezone(target_tz)
+            time_markers.append({
+                "line_coords": [[end1.latitude, end1.longitude], [end2.latitude, end2.longitude]],
+                "label_pos": [end1.latitude, end1.longitude],
+                "label_text": display_time.strftime('%H:%M'),
+            })
+        current_utc += datetime.timedelta(hours=1)
+
+    return time_markers
+
+
+def _classify_poi(tags):
+    """Return (poi_type, icon_color, icon_symbol) for a set of OSM tags."""
+    if tags.get('amenity') == 'fuel':
+        return 'Tankstelle', 'red', 'tint'
+    if tags.get('shop') == 'supermarket':
+        return 'Supermarkt', 'blue', 'shopping-cart'
+    if tags.get('shop') == 'convenience':
+        return 'Kiosk', 'green', 'shopping-basket'
+    if tags.get('amenity') == 'fast_food' and 'mcdonald' in tags.get('brand', '').lower():
+        return "McDonald's", 'orange', 'cutlery'
+    return 'Unbekannt', 'gray', 'question'
+
+
+def _eta_window(distance_m, speed_ms, start_utc, only_slower):
+    """Return (eta_avg, eta_earliest, eta_latest) as UTC datetimes."""
+    eta_avg = start_utc + datetime.timedelta(seconds=distance_m / speed_ms)
+    eta_latest = start_utc + datetime.timedelta(seconds=distance_m / (speed_ms * 0.9))
+    if only_slower:
+        return eta_avg, eta_avg, eta_latest
+    eta_earliest = start_utc + datetime.timedelta(seconds=distance_m / (speed_ms * 1.1))
+    return eta_avg, eta_earliest, eta_latest
+
+
+def _resolve_opening_status(opening_hours_str, lat, lon, eta_avg_utc, eta_earliest_utc, eta_latest_utc, tf):
+    """
+    Parse opening hours and return
+    (is_definitely_closed, status_text, eta_avg_local, eta_earliest_local, eta_latest_local).
+    Falls back to the original UTC times if timezone lookup fails.
+    """
+    if not opening_hours_str:
+        return False, "<i>Öffnungszeiten unbekannt</i>", eta_avg_utc, eta_earliest_utc, eta_latest_utc
+
+    try:
+        tz_str = tf.timezone_at(lng=lon, lat=lat)
+        if not tz_str:
+            return False, "<i>Zeitzone unbekannt</i>", eta_avg_utc, eta_earliest_utc, eta_latest_utc
+
+        local_tz = ZoneInfo(tz_str)
+        eta_avg_l = eta_avg_utc.astimezone(local_tz)
+        eta_early_l = eta_earliest_utc.astimezone(local_tz)
+        eta_late_l = eta_latest_utc.astimezone(local_tz)
+
+        is_open = OpeningHours(opening_hours_str).is_open(eta_avg_l)
+        color = 'green' if is_open else 'red'
+        word = 'Geöffnet' if is_open else 'Geschlossen'
+        status = f"<strong style='color:{color};'>{word}</strong> bei Ankunft"
+        return not is_open, status, eta_avg_l, eta_early_l, eta_late_l
+
+    except Exception:  # pylint: disable=broad-except
+        return False, "<i>Fehler bei Auswertung der Öffnungszeiten</i>", eta_avg_utc, eta_earliest_utc, eta_latest_utc
+
+
+def _build_popup_html(poi_type, name, status_text, eta_avg, eta_early, eta_late, opening_hours_str):
+    """Build the HTML string for a POI popup."""
+    return (
+        f"<b>{poi_type}: {name}</b><br>"
+        f"<hr style='margin: 3px 0;'>"
+        f"<b>Status:</b> {status_text}<br>"
+        f"<b>Ankunft (ca.):</b> {eta_avg.strftime('%A, %H:%M')} Uhr<br>"
+        f"<small><i>Fenster: {eta_early.strftime('%H:%M')} - {eta_late.strftime('%H:%M')}</i></small><br>"
+        f"<small>Regel: {opening_hours_str or 'n/a'}</small>"
+    )
+
+
+def _fetch_poi_markers(thinned, speed_ms, start_utc, hide_closed, only_slower, search_mc):
+    """Query Overpass in chunks and return a list of POI marker dicts."""
+    all_points = [p[0] for p in thinned]
+    processed_ids = set()
     poi_markers = []
-    CHUNK_SIZE = 150
-    processed_poi_ids = set()
     tf = TimezoneFinder()
-    num_chunks = (len(all_track_points) + CHUNK_SIZE - 1) // CHUNK_SIZE
 
     # precompute arrays once for fast vectorised closest-point search
-    track_lats = np.array([p.latitude for p in all_track_points])
-    track_lons = np.array([p.longitude for p in all_track_points])
-    cos_lat_factor = np.cos(np.radians(np.mean(track_lats)))
+    track_lats = np.array([p.latitude for p in all_points])
+    track_lons = np.array([p.longitude for p in all_points])
+    cos_lat = np.cos(np.radians(np.mean(track_lats)))
 
-    for i in range(0, len(all_track_points), CHUNK_SIZE):
-        chunk = all_track_points[i:i + CHUNK_SIZE + 1]
+    mc_clause = 'nwr.r["amenity"="fast_food"]["brand"~"McDonald\'s",i];' if search_mc else ""
+
+    for i in range(0, len(all_points), CHUNK_SIZE):
+        chunk = all_points[i:i + CHUNK_SIZE + 1]
         points_str = ",".join(str(c) for pt in chunk for c in (pt.latitude, pt.longitude))
-
-        mcdonalds_query_part = 'nwr.r["amenity"="fast_food"]["brand"~"McDonald\'s",i];' if search_mc else ""
-
-        overpass_query = f"""
+        query = f"""
         [out:json][timeout:90];
         nwr(around:1000,{points_str}) -> .r;
         (
           nwr.r["amenity"="fuel"];
           nwr.r["shop"="supermarket"];
           nwr.r["shop"="convenience"];
-          {mcdonalds_query_part}
+          {mc_clause}
         );out center;
         """
         try:
-            response = requests.post("https://overpass-api.de/api/interpreter", data={'data': overpass_query}, headers=OVERPASS_HEADERS)
-            response.raise_for_status()
-            data = response.json()
-            print(f"Abschnitt {i // CHUNK_SIZE + 1}: {len(data['elements'])} POIs von Overpass erhalten.")
-            for element in data['elements']:
-                element_id = element['id']
-                if element_id in processed_poi_ids: continue
-                processed_poi_ids.add(element_id)
+            resp = requests.post(
+                "https://overpass-api.de/api/interpreter",
+                data={'data': query},
+                headers=OVERPASS_HEADERS,
+                timeout=120,
+            )
+            resp.raise_for_status()
+            elements = resp.json().get('elements', [])
+            print(f"Chunk {i // CHUNK_SIZE + 1}: {len(elements)} elements received.")
+        except requests.RequestException as exc:
+            print(f"Chunk {i // CHUNK_SIZE + 1} failed: {exc}")
+            continue
 
-                lat = element.get('lat') or element.get('center', {}).get('lat')
-                lon = element.get('lon') or element.get('center', {}).get('lon')
-                if not lat or not lon: continue
+        for element in elements:
+            eid = element['id']
+            if eid in processed_ids:
+                continue
+            processed_ids.add(eid)
 
-                # flat-earth approx – accurate enough within a 1km search radius
-                dlat = track_lats - lat
-                dlon = (track_lons - lon) * cos_lat_factor
-                idx = int(np.argmin(dlat**2 + dlon**2))
-                distance_to_poi_m = thinned[idx][1]
-                
-                travel_time_avg_s = distance_to_poi_m / speed_ms if speed_ms > 0 else 0
-                eta_avg_utc = start_datetime_utc + datetime.timedelta(seconds=travel_time_avg_s)
+            lat = element.get('lat') or element.get('center', {}).get('lat')
+            lon = element.get('lon') or element.get('center', {}).get('lon')
+            if not lat or not lon:
+                continue
 
-                if only_slower:
-                    speed_slower_ms = speed_ms * 0.9
-                    travel_time_slower_s = distance_to_poi_m / speed_slower_ms if speed_slower_ms > 0 else 0
-                    eta_earliest_utc = eta_avg_utc
-                    eta_latest_utc = start_datetime_utc + datetime.timedelta(seconds=travel_time_slower_s)
-                else: 
-                    speed_faster_ms = speed_ms * 1.1
-                    speed_slower_ms = speed_ms * 0.9
-                    travel_time_faster_s = distance_to_poi_m / speed_faster_ms if speed_faster_ms > 0 else 0
-                    travel_time_slower_s = distance_to_poi_m / speed_slower_ms if speed_slower_ms > 0 else 0
-                    eta_earliest_utc = start_datetime_utc + datetime.timedelta(seconds=travel_time_faster_s)
-                    eta_latest_utc = start_datetime_utc + datetime.timedelta(seconds=travel_time_slower_s)
+            # flat-earth approx -- accurate enough within a 1km search radius
+            dlat = track_lats - lat
+            dlon = (track_lons - lon) * cos_lat
+            idx = int(np.argmin(dlat ** 2 + dlon ** 2))
+            distance_m = thinned[idx][1]
 
-                opening_hours_str = element.get('tags', {}).get('opening_hours')
-                is_definitely_closed = False
-                status_text = "<i>Öffnungszeiten unbekannt</i>"
-                eta_avg_local, eta_earliest_local, eta_latest_local = eta_avg_utc, eta_earliest_utc, eta_latest_utc
+            eta_avg, eta_earliest, eta_latest = _eta_window(distance_m, speed_ms, start_utc, only_slower)
+            opening_hours_str = element.get('tags', {}).get('opening_hours')
+            is_closed, status_text, eta_avg_l, eta_early_l, eta_late_l = _resolve_opening_status(
+                opening_hours_str, lat, lon, eta_avg, eta_earliest, eta_latest, tf
+            )
 
-                if opening_hours_str:
-                    try:
-                        tz_str = tf.timezone_at(lng=lon, lat=lat)
-                        if tz_str:
-                           local_tz = ZoneInfo(tz_str)
-                           eta_avg_local = eta_avg_utc.astimezone(local_tz)
-                           eta_earliest_local = eta_earliest_utc.astimezone(local_tz)
-                           eta_latest_local = eta_latest_utc.astimezone(local_tz)
-                           
-                           is_open = OpeningHours(opening_hours_str).is_open(eta_avg_local)
-                           is_definitely_closed = not is_open
+            # only skip if we actually know it's closed; no hours = always show
+            if hide_closed and is_closed:
+                continue
 
-                           status_color = 'green' if is_open else 'red'
-                           status_word = 'Geöffnet' if is_open else 'Geschlossen'
-                           status_text = f"<strong style='color:{status_color};'>{status_word}</strong> bei Ankunft"
-                    except Exception:
-                        status_text = "<i>Fehler bei Auswertung der Öffnungszeiten</i>"
-                
-                # only skip if we actually know it's closed; no hours = always show
-                if hide_closed and is_definitely_closed:
-                    continue
+            tags = element.get('tags', {})
+            poi_type, icon_color, icon_symbol = _classify_poi(tags)
+            popup = _build_popup_html(
+                poi_type, tags.get('name', 'Unbenannt'),
+                status_text, eta_avg_l, eta_early_l, eta_late_l, opening_hours_str
+            )
+            poi_markers.append({
+                "lat": lat, "lon": lon, "popup": popup,
+                "icon": {"color": icon_color, "symbol": icon_symbol},
+            })
 
-                tags = element.get('tags', {})
-                poi_type, icon_color, icon_symbol = "Unbekannt", "gray", "question"
-                if tags.get('amenity') == 'fuel': poi_type, icon_color, icon_symbol = 'Tankstelle', 'red', 'tint'
-                elif tags.get('shop') == 'supermarket': poi_type, icon_color, icon_symbol = 'Supermarkt', 'blue', 'shopping-cart'
-                elif tags.get('shop') == 'convenience': poi_type, icon_color, icon_symbol = 'Kiosk', 'green', 'shopping-basket'
-                elif tags.get('amenity') == 'fast_food' and 'mcdonald' in tags.get('brand','').lower():
-                    poi_type, icon_color, icon_symbol = "McDonald's", 'orange', 'cutlery'
-                
-                popup_html = f"""<b>{poi_type}: {tags.get('name', 'Unbenannt')}</b><br><hr style='margin: 3px 0;'><b>Status:</b> {status_text}<br><b>Ankunft (ca.):</b> {eta_avg_local.strftime('%A, %H:%M')} Uhr<br><small><i>Fenster: {eta_earliest_local.strftime('%H:%M')} - {eta_latest_local.strftime('%H:%M')}</i></small><br><small>Regel: {opening_hours_str or 'n/a'}</small>"""
-                
-                poi_markers.append({
-                    "lat": lat, "lon": lon, "popup": popup_html,
-                    "icon": {"color": icon_color, "symbol": icon_symbol}
-                })
-        except Exception as e:
-            print(f"Fehler bei Overpass-Abfrage für Abschnitt {i // CHUNK_SIZE + 1}: {e}")
-    print(f"Insgesamt {len(poi_markers)} POIs werden an das Frontend gesendet.")
+    print(f"Total POIs found: {len(poi_markers)}")
+    return poi_markers
+
+
+def process_gpx_data(gpx, average_speed_kmh, start_datetime_utc, hide_closed, only_slower, search_mc):
+    """Run all calculations and return (poi_markers, time_markers) for the frontend."""
+    track_points_with_dist = _build_cumulative_track(gpx)
+    if not track_points_with_dist:
+        return [], []
+
+    thinned = thin_track(track_points_with_dist, TRACK_THINNING_M)
+    speed_ms = (average_speed_kmh * 1000) / 3600
+    if speed_ms == 0:
+        return [], []
+
+    time_markers = _build_time_markers(thinned, speed_ms, start_datetime_utc)
+    poi_markers = _fetch_poi_markers(thinned, speed_ms, start_datetime_utc, hide_closed, only_slower, search_mc)
     return poi_markers, time_markers
 
 
 @app.route('/')
 def index():
+    """Serve the main page."""
     return render_template('index.html')
+
 
 @app.route('/generate-map', methods=['POST'])
 def generate_map():
+    """Accept a GPX file upload and return route, POIs, and time markers as JSON."""
     try:
         gpx_file = request.files['gpxFile']
         average_speed_kmh = float(request.form['averageSpeed'])
@@ -229,24 +284,21 @@ def generate_map():
         only_slower = request.form.get('onlySlower') == 'true'
         search_mc = request.form.get('searchMc') == 'true'
 
-        gpx_content = gpx_file.read().decode('utf-8')
-        gpx = gpxpy.parse(gpx_content)
+        gpx = gpxpy.parse(gpx_file.read().decode('utf-8'))
+        naive_dt = datetime.datetime.strptime(f"{start_date_str} {start_time_str}", "%Y-%m-%d %H:%M")
+        start_utc = naive_dt.astimezone().astimezone(datetime.timezone.utc)
 
-        naive_datetime = datetime.datetime.strptime(f"{start_date_str} {start_time_str}", "%Y-%m-%d %H:%M")
-        start_datetime_local = naive_datetime.astimezone()
-        start_datetime_utc = start_datetime_local.astimezone(datetime.timezone.utc)
+        poi_markers, time_markers = process_gpx_data(
+            gpx, average_speed_kmh, start_utc, hide_closed, only_slower, search_mc
+        )
 
-        poi_markers, time_markers = process_gpx_data(gpx, average_speed_kmh, start_datetime_utc, hide_closed, only_slower, search_mc)
-
-        # collect all route coordinates for the map line
-        route_points = []
-        for track in gpx.tracks:
-            for segment in track.segments:
-                for point in segment.points:
-                    route_points.append([point.latitude, point.longitude])
-        
+        route_points = [
+            [pt.latitude, pt.longitude]
+            for track in gpx.tracks
+            for segment in track.segments
+            for pt in segment.points
+        ]
         bounds = gpx.get_bounds()
-
         return jsonify({
             'success': True,
             'route': route_points,
@@ -256,14 +308,17 @@ def generate_map():
                 'min_lat': bounds.min_latitude,
                 'min_lon': bounds.min_longitude,
                 'max_lat': bounds.max_latitude,
-                'max_lon': bounds.max_longitude
-            } if bounds else None
+                'max_lon': bounds.max_longitude,
+            } if bounds else None,
         })
 
-    except Exception as e:
-        print(f"Ein Fehler ist aufgetreten: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+    except (ValueError, KeyError) as exc:
+        print(f"Bad request: {exc}")
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"Unexpected error: {exc}")
+        return jsonify({'success': False, 'error': str(exc)}), 500
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
-
