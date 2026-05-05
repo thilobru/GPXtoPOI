@@ -1,6 +1,7 @@
 ﻿"""Flask backend for GPXtoPOI – processes GPX files and queries Overpass for POIs."""
 # pylint: disable=import-error  # packages are installed in the runtime environment
 
+import dataclasses
 import datetime
 import math
 from zoneinfo import ZoneInfo
@@ -20,6 +21,22 @@ TRACK_THINNING_M = 200
 CHUNK_SIZE = 150
 
 
+@dataclasses.dataclass
+class ETAWindow:
+    """Arrival time estimates at a POI (avg, earliest, latest)."""
+    avg: datetime.datetime
+    earliest: datetime.datetime
+    latest: datetime.datetime
+
+
+@dataclasses.dataclass
+class PoiConfig:
+    """Settings controlling POI search and display filtering."""
+    hide_closed: bool
+    only_slower: bool
+    search_mc: bool
+
+
 def calculate_bearing(p1, p2):
     """Compass bearing from p1 to p2, in degrees (0-360)."""
     lat1, lon1 = math.radians(p1.latitude), math.radians(p1.longitude)
@@ -31,7 +48,8 @@ def calculate_bearing(p1, p2):
 
 
 def find_point_at_distance(target_dist, track_points_with_dist):
-    """Interpolate the lat/lon position and bearing at a given cumulative distance along the track."""
+    """Interpolate the lat/lon position and bearing at a given
+    cumulative distance along the track."""
     if target_dist < 0 or not track_points_with_dist or target_dist > track_points_with_dist[-1][1]:
         return None
     for i in range(1, len(track_points_with_dist)):
@@ -92,11 +110,10 @@ def _build_time_markers(thinned, speed_ms, start_datetime_utc):
             coords, bearing = result
             end1 = geodesic(kilometers=0.5).destination(coords, (bearing + 90) % 360)
             end2 = geodesic(kilometers=0.5).destination(coords, (bearing - 90 + 360) % 360)
-            display_time = current_utc.astimezone(target_tz)
             time_markers.append({
                 "line_coords": [[end1.latitude, end1.longitude], [end2.latitude, end2.longitude]],
                 "label_pos": [end1.latitude, end1.longitude],
-                "label_text": display_time.strftime('%H:%M'),
+                "label_text": current_utc.astimezone(target_tz).strftime('%H:%M'),
             })
         current_utc += datetime.timedelta(hours=1)
 
@@ -117,57 +134,61 @@ def _classify_poi(tags):
 
 
 def _eta_window(distance_m, speed_ms, start_utc, only_slower):
-    """Return (eta_avg, eta_earliest, eta_latest) as UTC datetimes."""
+    """Return an ETAWindow with avg/earliest/latest arrival times."""
     eta_avg = start_utc + datetime.timedelta(seconds=distance_m / speed_ms)
     eta_latest = start_utc + datetime.timedelta(seconds=distance_m / (speed_ms * 0.9))
     if only_slower:
-        return eta_avg, eta_avg, eta_latest
+        return ETAWindow(avg=eta_avg, earliest=eta_avg, latest=eta_latest)
     eta_earliest = start_utc + datetime.timedelta(seconds=distance_m / (speed_ms * 1.1))
-    return eta_avg, eta_earliest, eta_latest
+    return ETAWindow(avg=eta_avg, earliest=eta_earliest, latest=eta_latest)
 
 
-def _resolve_opening_status(opening_hours_str, lat, lon, eta_avg_utc, eta_earliest_utc, eta_latest_utc, tf):
+def _resolve_opening_status(opening_hours_str, lat, lon, eta_window, tf):
     """
-    Parse opening hours and return
-    (is_definitely_closed, status_text, eta_avg_local, eta_earliest_local, eta_latest_local).
-    Falls back to the original UTC times if timezone lookup fails.
+    Parse opening hours and localize the ETA window.
+    Returns (is_definitely_closed, status_text, localized_eta_window).
+    Falls back to UTC times if timezone lookup fails.
     """
     if not opening_hours_str:
-        return False, "<i>Öffnungszeiten unbekannt</i>", eta_avg_utc, eta_earliest_utc, eta_latest_utc
+        return False, "<i>Öffnungszeiten unbekannt</i>", eta_window
 
     try:
         tz_str = tf.timezone_at(lng=lon, lat=lat)
         if not tz_str:
-            return False, "<i>Zeitzone unbekannt</i>", eta_avg_utc, eta_earliest_utc, eta_latest_utc
+            return False, "<i>Zeitzone unbekannt</i>", eta_window
 
         local_tz = ZoneInfo(tz_str)
-        eta_avg_l = eta_avg_utc.astimezone(local_tz)
-        eta_early_l = eta_earliest_utc.astimezone(local_tz)
-        eta_late_l = eta_latest_utc.astimezone(local_tz)
-
-        is_open = OpeningHours(opening_hours_str).is_open(eta_avg_l)
+        localized = ETAWindow(
+            avg=eta_window.avg.astimezone(local_tz),
+            earliest=eta_window.earliest.astimezone(local_tz),
+            latest=eta_window.latest.astimezone(local_tz),
+        )
+        is_open = OpeningHours(opening_hours_str).is_open(localized.avg)
         color = 'green' if is_open else 'red'
         word = 'Geöffnet' if is_open else 'Geschlossen'
         status = f"<strong style='color:{color};'>{word}</strong> bei Ankunft"
-        return not is_open, status, eta_avg_l, eta_early_l, eta_late_l
+        return not is_open, status, localized
 
     except Exception:  # pylint: disable=broad-except
-        return False, "<i>Fehler bei Auswertung der Öffnungszeiten</i>", eta_avg_utc, eta_earliest_utc, eta_latest_utc
+        return False, "<i>Fehler bei Auswertung der Öffnungszeiten</i>", eta_window
 
 
-def _build_popup_html(poi_type, name, status_text, eta_avg, eta_early, eta_late, opening_hours_str):
+def _build_popup_html(poi_type, name, status_text, eta_window, opening_hours_str):
     """Build the HTML string for a POI popup."""
+    window_str = (
+        f"{eta_window.earliest.strftime('%H:%M')} – {eta_window.latest.strftime('%H:%M')}"
+    )
     return (
         f"<b>{poi_type}: {name}</b><br>"
         f"<hr style='margin: 3px 0;'>"
         f"<b>Status:</b> {status_text}<br>"
-        f"<b>Ankunft (ca.):</b> {eta_avg.strftime('%A, %H:%M')} Uhr<br>"
-        f"<small><i>Fenster: {eta_early.strftime('%H:%M')} - {eta_late.strftime('%H:%M')}</i></small><br>"
+        f"<b>Ankunft (ca.):</b> {eta_window.avg.strftime('%A, %H:%M')} Uhr<br>"
+        f"<small><i>Fenster: {window_str}</i></small><br>"
         f"<small>Regel: {opening_hours_str or 'n/a'}</small>"
     )
 
 
-def _fetch_poi_markers(thinned, speed_ms, start_utc, hide_closed, only_slower, search_mc):
+def _fetch_poi_markers(thinned, speed_ms, start_utc, config):  # pylint: disable=too-many-locals
     """Query Overpass in chunks and return a list of POI marker dicts."""
     all_points = [p[0] for p in thinned]
     processed_ids = set()
@@ -179,7 +200,7 @@ def _fetch_poi_markers(thinned, speed_ms, start_utc, hide_closed, only_slower, s
     track_lons = np.array([p.longitude for p in all_points])
     cos_lat = np.cos(np.radians(np.mean(track_lats)))
 
-    mc_clause = 'nwr.r["amenity"="fast_food"]["brand"~"McDonald\'s",i];' if search_mc else ""
+    mc_clause = 'nwr.r["amenity"="fast_food"]["brand"~"McDonald\'s",i];' if config.search_mc else ""
 
     for i in range(0, len(all_points), CHUNK_SIZE):
         chunk = all_points[i:i + CHUNK_SIZE + 1]
@@ -225,21 +246,21 @@ def _fetch_poi_markers(thinned, speed_ms, start_utc, hide_closed, only_slower, s
             idx = int(np.argmin(dlat ** 2 + dlon ** 2))
             distance_m = thinned[idx][1]
 
-            eta_avg, eta_earliest, eta_latest = _eta_window(distance_m, speed_ms, start_utc, only_slower)
+            eta_w = _eta_window(distance_m, speed_ms, start_utc, config.only_slower)
             opening_hours_str = element.get('tags', {}).get('opening_hours')
-            is_closed, status_text, eta_avg_l, eta_early_l, eta_late_l = _resolve_opening_status(
-                opening_hours_str, lat, lon, eta_avg, eta_earliest, eta_latest, tf
+            is_closed, status_text, eta_wl = _resolve_opening_status(
+                opening_hours_str, lat, lon, eta_w, tf
             )
 
             # only skip if we actually know it's closed; no hours = always show
-            if hide_closed and is_closed:
+            if config.hide_closed and is_closed:
                 continue
 
             tags = element.get('tags', {})
             poi_type, icon_color, icon_symbol = _classify_poi(tags)
             popup = _build_popup_html(
                 poi_type, tags.get('name', 'Unbenannt'),
-                status_text, eta_avg_l, eta_early_l, eta_late_l, opening_hours_str
+                status_text, eta_wl, opening_hours_str
             )
             poi_markers.append({
                 "lat": lat, "lon": lon, "popup": popup,
@@ -250,7 +271,7 @@ def _fetch_poi_markers(thinned, speed_ms, start_utc, hide_closed, only_slower, s
     return poi_markers
 
 
-def process_gpx_data(gpx, average_speed_kmh, start_datetime_utc, hide_closed, only_slower, search_mc):
+def process_gpx_data(gpx, average_speed_kmh, start_datetime_utc, config):
     """Run all calculations and return (poi_markers, time_markers) for the frontend."""
     track_points_with_dist = _build_cumulative_track(gpx)
     if not track_points_with_dist:
@@ -262,7 +283,7 @@ def process_gpx_data(gpx, average_speed_kmh, start_datetime_utc, hide_closed, on
         return [], []
 
     time_markers = _build_time_markers(thinned, speed_ms, start_datetime_utc)
-    poi_markers = _fetch_poi_markers(thinned, speed_ms, start_datetime_utc, hide_closed, only_slower, search_mc)
+    poi_markers = _fetch_poi_markers(thinned, speed_ms, start_datetime_utc, config)
     return poi_markers, time_markers
 
 
@@ -280,16 +301,19 @@ def generate_map():
         average_speed_kmh = float(request.form['averageSpeed'])
         start_date_str = request.form['startDate']
         start_time_str = request.form['startTime']
-        hide_closed = request.form.get('hideClosed') == 'true'
-        only_slower = request.form.get('onlySlower') == 'true'
-        search_mc = request.form.get('searchMc') == 'true'
+        poi_config = PoiConfig(
+            hide_closed=request.form.get('hideClosed') == 'true',
+            only_slower=request.form.get('onlySlower') == 'true',
+            search_mc=request.form.get('searchMc') == 'true',
+        )
 
         gpx = gpxpy.parse(gpx_file.read().decode('utf-8'))
-        naive_dt = datetime.datetime.strptime(f"{start_date_str} {start_time_str}", "%Y-%m-%d %H:%M")
+        dt_fmt = "%Y-%m-%d %H:%M"
+        naive_dt = datetime.datetime.strptime(f"{start_date_str} {start_time_str}", dt_fmt)
         start_utc = naive_dt.astimezone().astimezone(datetime.timezone.utc)
 
         poi_markers, time_markers = process_gpx_data(
-            gpx, average_speed_kmh, start_utc, hide_closed, only_slower, search_mc
+            gpx, average_speed_kmh, start_utc, poi_config
         )
 
         route_points = [
